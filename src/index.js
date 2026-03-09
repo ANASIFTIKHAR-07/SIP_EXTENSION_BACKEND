@@ -1,8 +1,6 @@
 import "dotenv/config"
 import connectDB from "./db/index.js";
 import {app} from "./app.js"
-// import "./services/drachito.service.js"
-import "./routes/sip.routes.js"
 
 
 connectDB()
