@@ -3,23 +3,28 @@ import {
     createSipExtension,
     deleteSipExtension,
     getAllSipExtensions,
-} from "../controllers/extension.controller.js"
+    registerSipExtension,
+    unregisterSipExtension,
+    getAllExtensionStatus,
+    getExtensionStatus,
+} from "../controllers/extension.controller.js";
 import { verifyJWT } from "../middlewares/auth.middleware.js";
-
 
 const router = Router();
 
 router.use(verifyJWT);
 
+// CRUD
+router.route("/").get(getAllSipExtensions);
+router.route("/").post(createSipExtension);
+router.route("/:id").delete(deleteSipExtension);
 
-router.route("/").get(getAllSipExtensions)
-router.route("/").post(createSipExtension)
-router.route("/:id").delete(deleteSipExtension)
+// Register / Unregister
+router.route("/register").post(registerSipExtension);
+router.route("/unregister").post(unregisterSipExtension);
 
-
-// POST   http://localhost:3000/register
-// POST   http://localhost:3000/unregister
-// GET    http://localhost:3000/status
-// GET    http://localhost:3000/status/:extension
+// Status
+router.route("/status").get(getAllExtensionStatus);
+router.route("/status/:extension").get(getExtensionStatus);
 
 export default router;

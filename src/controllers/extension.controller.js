@@ -1,78 +1,224 @@
+import { SipExtension } from "../models/sipExtension.model.js";
 import { ApiError } from "../utils/ApiError.js";
 import { ApiResponse } from "../utils/ApiResponse.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
-import { Sip } from "../models/extension.model.js";
-import { login } from "./user.controller.js";
 
+// ── In-memory registry of active drachtio SRF instances per extension ────────
+// key: extension string  →  value: { srf, req, res }
+export const activeSrfSessions = new Map();
 
-const createSipExtension = asyncHandler(async (req, res) => {
-    const { domain, extensionUsername, password, extension, pbx, displayName } = req.body;
-    if (
-        [domain, extensionUsername, password, extension].some((field) => field?.trim() === "")
-    ) {
-        throw new ApiError(400, "Domain, Extension Username, Password and Extension are required.");
-    }
-
-    const existedExtension = await Sip.findOne({
-        $or: [{ extension }, { extensionUsername }],
-        user: req.user._id,
-    });
-
-    if (existedExtension) {
-        throw new ApiError(409, "Extension or Extension Username already exists.");
-    }
-
-    const sipExtension = await Sip.create({
-        domain,
-        extensionUsername,
-        password,
-        extension,
-        pbx: pbx || null,
-        displayName: displayName || null,
-        user: req.user._id,
-    });
-
-    if (!sipExtension) {
-        throw new ApiError(500, "Something went wrong while creating SIP extension.");
-    }
-
-    return res.status(201).json(
-        new ApiResponse(201, sipExtension, "SIP extension created successfully.")
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/v1/sip/
+// Returns all SIP extensions belonging to the logged-in user
+// ─────────────────────────────────────────────────────────────────────────────
+const getAllSipExtensions = asyncHandler(async (req, res) => {
+    const extensions = await SipExtension.find({ createdBy: req.user._id }).select(
+        "-password"
     );
+
+    return res
+        .status(200)
+        .json(new ApiResponse(200, extensions, "Extensions fetched successfully"));
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/v1/sip/
+// Create & register a new SIP extension
+// Body: { extension, password, domain, displayName }
+// ─────────────────────────────────────────────────────────────────────────────
+const createSipExtension = asyncHandler(async (req, res) => {
+    const { extension, password, domain, displayName } = req.body;
 
+    if (!extension || !password || !domain) {
+        throw new ApiError(400, "extension, password and domain are required");
+    }
+
+    const existing = await SipExtension.findOne({ extension });
+    if (existing) {
+        throw new ApiError(409, `Extension ${extension} already exists`);
+    }
+
+    const newExtension = await SipExtension.create({
+        extension,
+        password,
+        domain,
+        displayName: displayName || extension,
+        createdBy: req.user._id,
+    });
+
+    return res
+        .status(201)
+        .json(
+            new ApiResponse(
+                201,
+                { extension: newExtension.extension, domain: newExtension.domain },
+                "SIP extension created successfully"
+            )
+        );
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DELETE /api/v1/sip/:id
+// Delete a SIP extension (only if owner)
+// ─────────────────────────────────────────────────────────────────────────────
 const deleteSipExtension = asyncHandler(async (req, res) => {
     const { id } = req.params;
 
-    const sipExtension = await Sip.findOne({
-        _id: id,
-        user: req.user._id,  
-    });
-
-    if (!sipExtension) {
-        throw new ApiError(404, "SIP extension not found.");
+    const ext = await SipExtension.findOne({ _id: id, createdBy: req.user._id });
+    if (!ext) {
+        throw new ApiError(404, "Extension not found or unauthorized");
     }
 
-    await Sip.findByIdAndDelete(id);
+    await SipExtension.findByIdAndDelete(id);
 
-    return res.status(200).json(
-        new ApiResponse(200, {}, "SIP extension deleted successfully.")
-    );
+    return res
+        .status(200)
+        .json(new ApiResponse(200, null, "Extension deleted successfully"));
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/v1/sip/register
+// Trigger SIP REGISTER on the drachtio server for an extension
+// Body: { extension }
+// ─────────────────────────────────────────────────────────────────────────────
+const registerSipExtension = asyncHandler(async (req, res) => {
+    const { extension } = req.body;
 
-const getAllSipExtensions = asyncHandler(async (req, res) => {
-    const sipExtensions = await Sip.find({ user: req.user._id }).select("-password");
+    if (!extension) throw new ApiError(400, "extension is required");
 
-    return res.status(200).json(
-        new ApiResponse(200, sipExtensions, "SIP extensions fetched successfully.")
-    );
+    const ext = await SipExtension.findOne({
+        extension,
+        createdBy: req.user._id,
+    });
+    if (!ext) throw new ApiError(404, "Extension not found");
+
+    // Dynamically import srf from the running realtime module
+    // The realtime.js module must export `srf` for this to work
+    let srf;
+    try {
+        const rtModule = await import("../realtime.js");
+        srf = rtModule.srf;
+    } catch {
+        throw new ApiError(503, "SIP server module not available");
+    }
+
+    await new Promise((resolve, reject) => {
+        srf.request(`sip:${ext.domain}`, {
+            method: "REGISTER",
+            headers: {
+                Contact: `<sip:${ext.extension}@${process.env.PUBLIC_IP}:5070>`,
+                To: `sip:${ext.extension}@${ext.domain}`,
+                From: `sip:${ext.extension}@${ext.domain}`,
+            },
+            auth: { username: ext.extension, password: ext.password },
+        }, (err, request) => {
+            if (err) return reject(new ApiError(502, `REGISTER failed: ${err.message}`));
+            request.on("response", async (sipRes) => {
+                if (sipRes.status === 200) {
+                    ext.isRegistered = true;
+                    ext.registeredAt = new Date();
+                    await ext.save();
+                    resolve();
+                } else {
+                    reject(new ApiError(502, `SIP responded ${sipRes.status} ${sipRes.reason}`));
+                }
+            });
+        });
+    });
+
+    return res
+        .status(200)
+        .json(new ApiResponse(200, { extension, registered: true }, "Extension registered"));
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/v1/sip/unregister
+// Send REGISTER with Expires: 0 to unregister
+// Body: { extension }
+// ─────────────────────────────────────────────────────────────────────────────
+const unregisterSipExtension = asyncHandler(async (req, res) => {
+    const { extension } = req.body;
+
+    if (!extension) throw new ApiError(400, "extension is required");
+
+    const ext = await SipExtension.findOne({
+        extension,
+        createdBy: req.user._id,
+    });
+    if (!ext) throw new ApiError(404, "Extension not found");
+
+    let srf;
+    try {
+        const rtModule = await import("../realtime.js");
+        srf = rtModule.srf;
+    } catch {
+        throw new ApiError(503, "SIP server module not available");
+    }
+
+    await new Promise((resolve, reject) => {
+        srf.request(`sip:${ext.domain}`, {
+            method: "REGISTER",
+            headers: {
+                Contact: `<sip:${ext.extension}@${process.env.PUBLIC_IP}:5070>;expires=0`,
+                To: `sip:${ext.extension}@${ext.domain}`,
+                From: `sip:${ext.extension}@${ext.domain}`,
+                Expires: "0",
+            },
+            auth: { username: ext.extension, password: ext.password },
+        }, (err, request) => {
+            if (err) return reject(new ApiError(502, `UNREGISTER failed: ${err.message}`));
+            request.on("response", async (sipRes) => {
+                ext.isRegistered = false;
+                await ext.save();
+                resolve();
+            });
+        });
+    });
+
+    return res
+        .status(200)
+        .json(new ApiResponse(200, { extension, registered: false }, "Extension unregistered"));
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/v1/sip/status
+// Get registration status of all extensions for current user
+// ─────────────────────────────────────────────────────────────────────────────
+const getAllExtensionStatus = asyncHandler(async (req, res) => {
+    const extensions = await SipExtension.find({ createdBy: req.user._id }).select(
+        "extension domain isRegistered registeredAt displayName"
+    );
+
+    return res
+        .status(200)
+        .json(new ApiResponse(200, extensions, "Status fetched"));
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/v1/sip/status/:extension
+// Get registration status of a single extension
+// ─────────────────────────────────────────────────────────────────────────────
+const getExtensionStatus = asyncHandler(async (req, res) => {
+    const { extension } = req.params;
+
+    const ext = await SipExtension.findOne({
+        extension,
+        createdBy: req.user._id,
+    }).select("extension domain isRegistered registeredAt displayName");
+
+    if (!ext) throw new ApiError(404, "Extension not found");
+
+    return res
+        .status(200)
+        .json(new ApiResponse(200, ext, "Extension status fetched"));
+});
 
 export {
+    getAllSipExtensions,
     createSipExtension,
     deleteSipExtension,
-    getAllSipExtensions,
+    registerSipExtension,
+    unregisterSipExtension,
+    getAllExtensionStatus,
+    getExtensionStatus,
 };

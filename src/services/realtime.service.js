@@ -2,19 +2,18 @@
  * realtime.js — Raw WS Deepgram + OpenAI
  * Fixed: RTP send back to correct address + debug logging
  * Fixed: Interruption sensitivity (higher threshold + debounce)
+ * Updated: exports `srf` for extension.controller + integrates activeCalls
  */
-
-// const Srf = require("drachtio-srf");
-// const dgram = require("dgram");
-// const WebSocket = require("ws");
-// const OpenAI = require("openai");
 
 import Srf from "drachtio-srf";
 import dgram from "dgram";
 import WebSocket from "ws";
 import OpenAI from "openai";
+import { v4 as uuidv4 } from "uuid";
+import { activeCalls } from "./controllers/call.controller.js";
+import { CallLog } from "./models/callLog.model.js";
 
-const srf = new Srf();
+export const srf = new Srf();
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const DEEPGRAM_KEY = process.env.DEEPGRAM_API_KEY;
@@ -22,10 +21,6 @@ const PUBLIC_IP = process.env.PUBLIC_IP;
 
 if (!DEEPGRAM_KEY) {
   console.error("❌ Set DEEPGRAM_API_KEY");
-  process.exit(1);
-}
-if (!openai) {
-  console.error("❌ Set OPENAI_API_KEY");
   process.exit(1);
 }
 
@@ -83,7 +78,6 @@ function pcm24kToMulaw8k(buf) {
 }
 
 // ── RTP Sender ────────────────────────────────────────────────────────────────
-// sendSock is SHARED — same socket we receive on, so source port matches
 function createRtpSender(sendSock, host, port) {
   let seq = Math.floor(Math.random() * 65535);
   let ts = Math.floor(Math.random() * 0xffffffff);
@@ -182,11 +176,9 @@ function createDeepgramWS(onUtterance) {
           if (ws.readyState === WebSocket.OPEN) ws.send(buf);
         },
         close: () => {
-          try {
-            ws.close();
-          } catch (_) {}
+          try { ws.close(); } catch (_) {}
         },
-      }),
+      })
     );
     ws.once("error", reject);
   });
@@ -201,12 +193,17 @@ async function respondToUser(
   onStart,
   onDone,
   isInterrupted,
+  isBotEnabled,
 ) {
+  // Respect bot-enabled flag set via API
+  if (!isBotEnabled()) {
+    console.log("🤖 Bot disabled for this call — skipping response");
+    return;
+  }
+
   console.log(`\n💬 User: ${transcript}`);
   history.push({ role: "user", content: transcript });
 
-  // Use the SAME socket that receives RTP — this way Asterisk sees packets
-  // coming from our port and routes them correctly
   const sender = createRtpSender(rtpSock, remote.ip, remote.port);
   onStart(sender);
 
@@ -232,7 +229,7 @@ async function respondToUser(
 
     async function flushTTS(text) {
       text = text.trim();
-      if (!text || isInterrupted()) return;
+      if (!text || isInterrupted() || !isBotEnabled()) return;
       console.log(`🗣️  TTS: "${text}"`);
       try {
         const res = await openai.audio.speech.create({
@@ -242,20 +239,20 @@ async function respondToUser(
           response_format: "pcm",
           speed: 1.0,
         });
-        if (isInterrupted()) return;
+        if (isInterrupted() || !isBotEnabled()) return;
         const pcm = Buffer.from(await res.arrayBuffer());
         const mulaw = pcm24kToMulaw8k(pcm);
         console.log(
-          `🔊 Streaming ${mulaw.length} bytes (${Math.ceil(mulaw.length / 160)} packets) → ${remote.ip}:${remote.port}`,
+          `🔊 Streaming ${mulaw.length} bytes (${Math.ceil(mulaw.length / 160)} packets) → ${remote.ip}:${remote.port}`
         );
-        if (!isInterrupted()) await sender.streamBuffer(mulaw);
+        if (!isInterrupted() && isBotEnabled()) await sender.streamBuffer(mulaw);
       } catch (e) {
         console.error("❌ TTS error:", e.message);
       }
     }
 
     for await (const chunk of stream) {
-      if (isInterrupted()) break;
+      if (isInterrupted() || !isBotEnabled()) break;
       const token = chunk.choices[0]?.delta?.content || "";
       fullReply += token;
       pending += token;
@@ -264,13 +261,13 @@ async function respondToUser(
         const parts = pending.split(/(?<=[.!?।])\s+/);
         for (let i = 0; i < parts.length - 1; i++) {
           await flushTTS(parts[i]);
-          if (isInterrupted()) break;
+          if (isInterrupted() || !isBotEnabled()) break;
         }
         pending = parts[parts.length - 1] || "";
       }
     }
 
-    if (!isInterrupted() && pending.trim()) await flushTTS(pending);
+    if (!isInterrupted() && isBotEnabled() && pending.trim()) await flushTTS(pending);
 
     if (!isInterrupted()) {
       history.push({ role: "assistant", content: fullReply });
@@ -286,7 +283,7 @@ async function respondToUser(
 }
 
 // ── Call Handler ──────────────────────────────────────────────────────────────
-async function handleCall(localRtpPort, remote) {
+async function handleCall(localRtpPort, remote, callMeta) {
   const history = [];
   let currentSender = null;
   let botSpeaking = false;
@@ -303,28 +300,21 @@ async function handleCall(localRtpPort, remote) {
     }
   }
 
-  // ── Single shared UDP socket for RX and TX ────────────────────────────────
   const rtpSock = dgram.createSocket("udp4");
   let actualRemote = { ...remote };
   let firstPacket = true;
   let highEnergyCount = 0;
 
-  // ── Tune these two values to control interruption sensitivity ────────────
-  // INTERRUPT_THRESHOLD: energy score per sample (0–127 scale for mulaw)
-  //   • Lower = more sensitive (triggers on quiet sounds / echo)
-  //   • Higher = less sensitive (needs louder voice to interrupt)
-  //   Recommended range: 40–60  (was 20 — way too low)
   const INTERRUPT_THRESHOLD = 50;
-
-  // INTERRUPT_PACKETS: how many consecutive high-energy 20ms packets needed
-  //   • 1  = instant interrupt (old behaviour)
-  //   • 3  = ~60ms of loud audio required
-  //   • 5  = ~100ms  ← good balance
-  //   • 8  = ~160ms  ← more deliberate barge-in only
   const INTERRUPT_PACKETS = 5;
 
   const dg = await createDeepgramWS(async (transcript) => {
     if (!transcript) return;
+
+    // Check bot-enabled flag from activeCalls map (can be toggled via API)
+    const callEntry = activeCalls.get(callMeta.callId);
+    const isBotEnabled = () => callEntry?.botEnabled ?? true;
+
     if (botSpeaking) interrupt();
     if (processing) return;
 
@@ -339,12 +329,16 @@ async function handleCall(localRtpPort, remote) {
       (s) => {
         currentSender = s;
         botSpeaking = true;
+        // Expose sender to API for stop-bot
+        if (callEntry) callEntry.currentSender = s;
       },
       () => {
         botSpeaking = false;
         processing = false;
+        if (callEntry) callEntry.currentSender = null;
       },
       () => interrupted,
+      isBotEnabled,
     );
 
     processing = false;
@@ -356,16 +350,13 @@ async function handleCall(localRtpPort, remote) {
     if (firstPacket) {
       actualRemote = { ip: rinfo.address, port: rinfo.port };
       console.log(
-        `🎯 First RTP from ${rinfo.address}:${rinfo.port} (SDP said ${remote.ip}:${remote.port})`,
+        `🎯 First RTP from ${rinfo.address}:${rinfo.port} (SDP said ${remote.ip}:${remote.port})`
       );
       firstPacket = false;
     }
 
     const payload = msg.slice(12);
 
-    // ── Interruption detection with debounce ─────────────────────────────
-    // Only interrupt if caller speaks LOUDLY for multiple consecutive packets
-    // This prevents echo / background noise from cutting off the bot
     if (botSpeaking) {
       const energy =
         payload.reduce((s, b) => s + ((b & 0x7f) ^ 0x7f), 0) / payload.length;
@@ -377,7 +368,6 @@ async function handleCall(localRtpPort, remote) {
           interrupt();
         }
       } else {
-        // Reset counter — must be consecutive packets
         highEnergyCount = 0;
       }
     } else {
@@ -396,9 +386,7 @@ async function handleCall(localRtpPort, remote) {
   return {
     stop: () => {
       dg.close();
-      try {
-        rtpSock.close();
-      } catch (_) {}
+      try { rtpSock.close(); } catch (_) {}
       if (currentSender) currentSender.stop();
     },
   };
@@ -428,7 +416,7 @@ srf.on("connect", (err) => {
         console.log(`📩 ${res.status} ${res.reason}`);
         if (res.status === 200) console.log("🚀 REGISTERED!");
       });
-    },
+    }
   );
 });
 
@@ -436,30 +424,73 @@ srf.invite(async (req, res) => {
   const fromNum = req.callingNumber || "unknown";
   const toNum = req.calledNumber || "unknown";
   const remote = parseRemoteRtp(req.body);
+  const callId = uuidv4();
 
-  console.log(`\n📞 Call: ${fromNum} → ${toNum}`);
+  console.log(`\n📞 Call: ${fromNum} → ${toNum}  [${callId}]`);
   console.log(`📡 Remote RTP from SDP: ${remote.ip}:${remote.port}`);
   res.send(100);
 
   try {
     const port = getFreePort();
-    const session = await handleCall(port, remote);
+    const callMeta = { callId, fromNumber: fromNum, toNumber: toNum, extension: "208" };
+
+    const session = await handleCall(port, remote, callMeta);
+
+    // ── Log to DB + in-memory ──────────────────────────────────────────────
+    await CallLog.create({
+      callId,
+      extension: "208",
+      fromNumber: fromNum,
+      toNumber: toNum,
+      remoteIp: remote.ip,
+      remotePort: remote.port,
+      status: "active",
+      botEnabled: true,
+    });
+
+    activeCalls.set(callId, {
+      session,
+      fromNumber: fromNum,
+      toNumber: toNum,
+      extension: "208",
+      startedAt: new Date(),
+      botEnabled: true,
+      currentSender: null,
+    });
+
     const dialog = await srf.createUAS(req, res, {
       localSdp: buildAnswerSdp(port),
     });
 
     console.log("✅ Call LIVE!\n");
 
-    dialog.on("destroy", () => {
+    dialog.on("destroy", async () => {
       console.log("📵 Call ended");
       session.stop();
       usedPorts.delete(port);
+
+      // ── Update DB + remove from active map ─────────────────────────────
+      const startedAt = activeCalls.get(callId)?.startedAt;
+      activeCalls.delete(callId);
+
+      await CallLog.findOneAndUpdate(
+        { callId },
+        {
+          status: "ended",
+          endedAt: new Date(),
+          durationSeconds: startedAt
+            ? Math.floor((Date.now() - startedAt.getTime()) / 1000)
+            : null,
+        }
+      );
     });
   } catch (e) {
     console.error("❌ Call error:", e.message);
-    try {
-      res.send(500);
-    } catch (_) {}
+
+    await CallLog.findOneAndUpdate({ callId }, { status: "failed" }).catch(() => {});
+    activeCalls.delete(callId);
+
+    try { res.send(500); } catch (_) {}
   }
 });
 

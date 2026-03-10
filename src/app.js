@@ -20,8 +20,11 @@ app.use(express.static("public"))
 
 import userRoutes from "./routes/user.routes.js"
 import extensionRoutes from "./routes/extension.routes.js"
+import callRoutes from "./routes/call.routes.js"
+
 app.use("/api/v1/users", userRoutes)
 app.use("/api/v1/sip", extensionRoutes)
+app.use("/api/v1/calls", callRoutes);
 
 
 
