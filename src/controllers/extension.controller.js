@@ -2,11 +2,11 @@ import { ApiError } from "../utils/ApiError.js";
 import { ApiResponse } from "../utils/ApiResponse.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
 import { Sip } from "../models/extension.model.js";
+import { login } from "./user.controller.js";
 
 
 const createSipExtension = asyncHandler(async (req, res) => {
     const { domain, extensionUsername, password, extension, pbx, displayName } = req.body;
-
     if (
         [domain, extensionUsername, password, extension].some((field) => field?.trim() === "")
     ) {

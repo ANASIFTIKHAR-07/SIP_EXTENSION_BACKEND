@@ -17,4 +17,9 @@ router.route("/").post(createSipExtension)
 router.route("/:id").delete(deleteSipExtension)
 
 
+// POST   http://localhost:3000/register
+// POST   http://localhost:3000/unregister
+// GET    http://localhost:3000/status
+// GET    http://localhost:3000/status/:extension
+
 export default router;
