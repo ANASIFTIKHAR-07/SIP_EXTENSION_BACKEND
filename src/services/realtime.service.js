@@ -10,8 +10,8 @@ import dgram from "dgram";
 import WebSocket from "ws";
 import OpenAI from "openai";
 import { v4 as uuidv4 } from "uuid";
-import { activeCalls } from "./controllers/call.controller.js";
-import { CallLog } from "./models/callLog.model.js";
+import { activeCalls } from "../controllers/call.controller.js";
+import { CallLog } from "../models/calllog.model.js";
 
 export const srf = new Srf();
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -396,7 +396,10 @@ async function handleCall(localRtpPort, remote, callMeta) {
 srf.connect({ host: "127.0.0.1", port: 9022, secret: "cymru" });
 
 srf.on("connect", (err) => {
-  if (err) return console.error("❌", err);
+  if (err) {
+    console.error("❌ drachtio connection error:", err.message);
+    return;
+  }
   console.log("✅ drachtio connected. Registering...");
 
   srf.request(
@@ -418,6 +421,10 @@ srf.on("connect", (err) => {
       });
     }
   );
+});
+
+srf.on("error", (err) => {
+  console.error("❌ SIP server error:", err.message);
 });
 
 srf.invite(async (req, res) => {

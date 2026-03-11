@@ -25,6 +25,7 @@
     "mongoose-aggregate-paginate-v2": "^1.1.4",
     "openai": "^6.27.0",
     "rtpengine-client": "^0.4.12",
+    "uuid": "^11.0.3",
     "ws": "^8.19.0"
   }
 }

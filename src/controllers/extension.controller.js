@@ -1,4 +1,4 @@
-import { SipExtension } from "../models/sipExtension.model.js";
+import { SipExtension } from "../models/extension.model.js";
 import { ApiError } from "../utils/ApiError.js";
 import { ApiResponse } from "../utils/ApiResponse.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
@@ -46,12 +46,14 @@ const createSipExtension = asyncHandler(async (req, res) => {
         createdBy: req.user._id,
     });
 
+    const createdExtension = await SipExtension.findById(newExtension._id).select("-password");
+
     return res
         .status(201)
         .json(
             new ApiResponse(
                 201,
-                { extension: newExtension.extension, domain: newExtension.domain },
+                createdExtension,
                 "SIP extension created successfully"
             )
         );
@@ -96,10 +98,14 @@ const registerSipExtension = asyncHandler(async (req, res) => {
     // The realtime.js module must export `srf` for this to work
     let srf;
     try {
-        const rtModule = await import("../realtime.js");
+        const rtModule = await import("../services/realtime.service.js");
         srf = rtModule.srf;
-    } catch {
-        throw new ApiError(503, "SIP server module not available");
+        if (!srf) {
+            throw new ApiError(503, "SIP server not initialized");
+        }
+    } catch (error) {
+        if (error.statusCode) throw error;
+        throw new ApiError(503, "SIP server module not available. Make sure drachtio server is running.");
     }
 
     await new Promise((resolve, reject) => {
@@ -149,10 +155,14 @@ const unregisterSipExtension = asyncHandler(async (req, res) => {
 
     let srf;
     try {
-        const rtModule = await import("../realtime.js");
+        const rtModule = await import("../services/realtime.service.js");
         srf = rtModule.srf;
-    } catch {
-        throw new ApiError(503, "SIP server module not available");
+        if (!srf) {
+            throw new ApiError(503, "SIP server not initialized");
+        }
+    } catch (error) {
+        if (error.statusCode) throw error;
+        throw new ApiError(503, "SIP server module not available. Make sure drachtio server is running.");
     }
 
     await new Promise((resolve, reject) => {

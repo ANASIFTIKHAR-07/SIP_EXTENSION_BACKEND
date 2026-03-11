@@ -2,6 +2,8 @@ import "dotenv/config"
 import connectDB from "./db/index.js";
 import {app} from "./app.js"
 
+// Note: SIP/Realtime service will be loaded on-demand when needed
+// This prevents blocking the server startup if drachtio is not available
 
 connectDB()
 .then(()=> {
