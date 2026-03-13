@@ -134,16 +134,69 @@ function createRtpSender(sendSock, host, port) {
 }
 
 // ── Deepgram WebSocket ────────────────────────────────────────────────────────
+// function createDeepgramWS(onUtterance) {
+//   const params = new URLSearchParams({
+//     model: "nova-2",
+//     language: "multi",
+//     encoding: "mulaw",
+//     sample_rate: "8000",
+//     channels: "1",
+//     endpointing: "400",
+//     interim_results: "true",
+//     utterance_end_ms: "1200",
+//   });
+
+//   const ws = new WebSocket(`wss://api.deepgram.com/v1/listen?${params}`, {
+//     headers: { Authorization: `Token ${DEEPGRAM_KEY}` },
+//   });
+
+//   ws.on("open", () => console.log("🟢 Deepgram WS connected"));
+//   ws.on("error", (e) => console.error("❌ Deepgram error:", e.message));
+//   ws.on("close", (c) => console.log(`🔴 Deepgram closed (${c})`));
+
+//   ws.on("message", (raw) => {
+//     try {
+//       const data = JSON.parse(raw.toString());
+//       const txt = data.channel?.alternatives?.[0]?.transcript?.trim();
+//       if (!txt) return;
+
+//       if (data.is_final) {
+//         process.stdout.write(`\r📝 [FINAL] ${txt}\n`);
+//         if (data.speech_final) onUtterance(txt);
+//       } else {
+//         process.stdout.write(`\r📝 [live]  ${txt}          `);
+//       }
+//     } catch (_) {}
+//   });
+
+//   return new Promise((resolve, reject) => {
+//     ws.once("open", () =>
+//       resolve({
+//         send: (buf) => {
+//           if (ws.readyState === WebSocket.OPEN) ws.send(buf);
+//         },
+//         close: () => {
+//           try { ws.close(); } catch (_) {}
+//         },
+//       })
+//     );
+//     ws.once("error", reject);
+//   });
+// }
+
+//  My version - Still to be tested. Changed the Deepgram Model and some configuration
 function createDeepgramWS(onUtterance) {
   const params = new URLSearchParams({
-    model: "nova-2",
-    language: "multi",
+    model: "nova-3",
     encoding: "mulaw",
     sample_rate: "8000",
     channels: "1",
-    endpointing: "400",
+    detect_language: "true",
     interim_results: "true",
-    utterance_end_ms: "1200",
+    endpointing: "300",
+    utterance_end_ms: "800",
+    smart_format: "true",
+    punctuate: "true"
   });
 
   const ws = new WebSocket(`wss://api.deepgram.com/v1/listen?${params}`, {
@@ -158,13 +211,20 @@ function createDeepgramWS(onUtterance) {
     try {
       const data = JSON.parse(raw.toString());
       const txt = data.channel?.alternatives?.[0]?.transcript?.trim();
+      const detectedLang = data.channel?.detected_language;
+
       if (!txt) return;
+      if (txt.length < 2) return;
+
 
       if (data.is_final) {
-        process.stdout.write(`\r📝 [FINAL] ${txt}\n`);
+        process.stdout.write(`\r📝 [FINAL ${detectedLang || ""}] ${txt}\n`);
+
         if (data.speech_final) onUtterance(txt);
       } else {
-        process.stdout.write(`\r📝 [live]  ${txt}          `);
+        process.stdout.write(
+          `\r📝 [live ${detectedLang || ""}] ${txt}          `,
+        );
       }
     } catch (_) {}
   });
@@ -176,15 +236,115 @@ function createDeepgramWS(onUtterance) {
           if (ws.readyState === WebSocket.OPEN) ws.send(buf);
         },
         close: () => {
-          try { ws.close(); } catch (_) {}
+          try {
+            ws.close();
+          } catch (_) {}
         },
-      })
+      }),
     );
     ws.once("error", reject);
   });
 }
 
 // ── GPT + TTS ─────────────────────────────────────────────────────────────────
+// async function respondToUser(
+//   transcript,
+//   history,
+//   rtpSock,
+//   remote,
+//   onStart,
+//   onDone,
+//   isInterrupted,
+//   isBotEnabled,
+// ) {
+//   // Respect bot-enabled flag set via API
+//   if (!isBotEnabled()) {
+//     console.log("🤖 Bot disabled for this call — skipping response");
+//     return;
+//   }
+
+//   console.log(`\n💬 User: ${transcript}`);
+//   history.push({ role: "user", content: transcript });
+
+//   const sender = createRtpSender(rtpSock, remote.ip, remote.port);
+//   onStart(sender);
+
+//   console.log(`📤 Will send audio → ${remote.ip}:${remote.port}`);
+
+//   try {
+//     const stream = await openai.chat.completions.create({
+//       model: "gpt-4o-mini",
+//       stream: true,
+//       max_tokens: 120,
+//       messages: [
+//         {
+//           role: "system",
+//           content:
+//             "You are a helpful voice assistant on a phone call. Keep answers SHORT — 1 to 2 sentences. Be natural and conversational.",
+//         },
+//         ...history,
+//       ],
+//     });
+
+//     let fullReply = "";
+//     let pending = "";
+
+//     async function flushTTS(text) {
+//       text = text.trim();
+//       if (!text || isInterrupted() || !isBotEnabled()) return;
+//       console.log(`🗣️  TTS: "${text}"`);
+//       try {
+//         const res = await openai.audio.speech.create({
+//           model: "tts-1",
+//           voice: "alloy",
+//           input: text,
+//           response_format: "pcm",
+//           speed: 1.0,
+//         });
+//         if (isInterrupted() || !isBotEnabled()) return;
+//         const pcm = Buffer.from(await res.arrayBuffer());
+//         const mulaw = pcm24kToMulaw8k(pcm);
+//         console.log(
+//           `🔊 Streaming ${mulaw.length} bytes (${Math.ceil(mulaw.length / 160)} packets) → ${remote.ip}:${remote.port}`
+//         );
+//         if (!isInterrupted() && isBotEnabled()) await sender.streamBuffer(mulaw);
+//       } catch (e) {
+//         console.error("❌ TTS error:", e.message);
+//       }
+//     }
+
+//     for await (const chunk of stream) {
+//       if (isInterrupted() || !isBotEnabled()) break;
+//       const token = chunk.choices[0]?.delta?.content || "";
+//       fullReply += token;
+//       pending += token;
+
+//       if (/[.!?।]\s/.test(pending)) {
+//         const parts = pending.split(/(?<=[.!?।])\s+/);
+//         for (let i = 0; i < parts.length - 1; i++) {
+//           await flushTTS(parts[i]);
+//           if (isInterrupted() || !isBotEnabled()) break;
+//         }
+//         pending = parts[parts.length - 1] || "";
+//       }
+//     }
+
+//     if (!isInterrupted() && isBotEnabled() && pending.trim()) await flushTTS(pending);
+
+//     if (!isInterrupted()) {
+//       history.push({ role: "assistant", content: fullReply });
+//       console.log(`\n🤖 Bot: ${fullReply}`);
+//     }
+//   } catch (e) {
+//     console.error("❌ GPT error:", e.message);
+//   }
+
+//   sender.stop();
+//   onDone();
+//   console.log("\n🎙️  Listening...");
+// }
+
+// Updated Version
 async function respondToUser(
   transcript,
   history,
@@ -213,12 +373,25 @@ async function respondToUser(
     const stream = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       stream: true,
-      max_tokens: 120,
+      max_tokens: 60,
+      temperature: 0.6,
       messages: [
         {
           role: "system",
-          content:
-            "You are a helpful voice assistant on a phone call. Keep answers SHORT — 1 to 2 sentences. Be natural and conversational.",
+          content: `
+          You are a helpful AI voice assistant on a phone call.
+
+          The caller may speak English, Urdu, or Arabic.
+          Always respond in the SAME language the user speaks.
+
+          Rules:
+          - Keep responses short (1–2 sentences)
+          - Use natural spoken language
+          - No lists or long explanations
+          - Sound like a polite call center agent
+          - Respond quickly and concisely
+          - If the audio is unclear, politely ask the caller to repeat
+          `,
         },
         ...history,
       ],
@@ -234,7 +407,7 @@ async function respondToUser(
       try {
         const res = await openai.audio.speech.create({
           model: "tts-1",
-          voice: "alloy",
+          voice: "verse",
           input: text,
           response_format: "pcm",
           speed: 1.0,
@@ -243,9 +416,10 @@ async function respondToUser(
         const pcm = Buffer.from(await res.arrayBuffer());
         const mulaw = pcm24kToMulaw8k(pcm);
         console.log(
-          `🔊 Streaming ${mulaw.length} bytes (${Math.ceil(mulaw.length / 160)} packets) → ${remote.ip}:${remote.port}`
+          `🔊 Streaming ${mulaw.length} bytes (${Math.ceil(mulaw.length / 160)} packets) → ${remote.ip}:${remote.port}`,
         );
-        if (!isInterrupted() && isBotEnabled()) await sender.streamBuffer(mulaw);
+        if (!isInterrupted() && isBotEnabled())
+          await sender.streamBuffer(mulaw);
       } catch (e) {
         console.error("❌ TTS error:", e.message);
       }
@@ -257,8 +431,8 @@ async function respondToUser(
       fullReply += token;
       pending += token;
 
-      if (/[.!?।]\s/.test(pending)) {
-        const parts = pending.split(/(?<=[.!?।])\s+/);
+      if (/[.!?؟۔]\s/.test(pending)) {
+        const parts = pending.split(/(?<=[.!?؟۔])\s+/);
         for (let i = 0; i < parts.length - 1; i++) {
           await flushTTS(parts[i]);
           if (isInterrupted() || !isBotEnabled()) break;
@@ -267,7 +441,8 @@ async function respondToUser(
       }
     }
 
-    if (!isInterrupted() && isBotEnabled() && pending.trim()) await flushTTS(pending);
+    if (!isInterrupted() && isBotEnabled() && pending.trim())
+      await flushTTS(pending);
 
     if (!isInterrupted()) {
       history.push({ role: "assistant", content: fullReply });
@@ -350,7 +525,7 @@ async function handleCall(localRtpPort, remote, callMeta) {
     if (firstPacket) {
       actualRemote = { ip: rinfo.address, port: rinfo.port };
       console.log(
-        `🎯 First RTP from ${rinfo.address}:${rinfo.port} (SDP said ${remote.ip}:${remote.port})`
+        `🎯 First RTP from ${rinfo.address}:${rinfo.port} (SDP said ${remote.ip}:${remote.port})`,
       );
       firstPacket = false;
     }
@@ -386,7 +561,9 @@ async function handleCall(localRtpPort, remote, callMeta) {
   return {
     stop: () => {
       dg.close();
-      try { rtpSock.close(); } catch (_) {}
+      try {
+        rtpSock.close();
+      } catch (_) {}
       if (currentSender) currentSender.stop();
     },
   };
@@ -419,7 +596,7 @@ srf.on("connect", (err) => {
         console.log(`📩 ${res.status} ${res.reason}`);
         if (res.status === 200) console.log("🚀 REGISTERED!");
       });
-    }
+    },
   );
 });
 
@@ -439,7 +616,12 @@ srf.invite(async (req, res) => {
 
   try {
     const port = getFreePort();
-    const callMeta = { callId, fromNumber: fromNum, toNumber: toNum, extension: "208" };
+    const callMeta = {
+      callId,
+      fromNumber: fromNum,
+      toNumber: toNum,
+      extension: "208",
+    };
 
     const session = await handleCall(port, remote, callMeta);
 
@@ -488,16 +670,20 @@ srf.invite(async (req, res) => {
           durationSeconds: startedAt
             ? Math.floor((Date.now() - startedAt.getTime()) / 1000)
             : null,
-        }
+        },
       );
     });
   } catch (e) {
     console.error("❌ Call error:", e.message);
 
-    await CallLog.findOneAndUpdate({ callId }, { status: "failed" }).catch(() => {});
+    await CallLog.findOneAndUpdate({ callId }, { status: "failed" }).catch(
+      () => {},
+    );
     activeCalls.delete(callId);
 
-    try { res.send(500); } catch (_) {}
+    try {
+      res.send(500);
+    } catch (_) {}
   }
 });
 
