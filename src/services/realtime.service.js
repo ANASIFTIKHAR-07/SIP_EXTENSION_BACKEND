@@ -188,7 +188,7 @@ function createRtpSender(sendSock, host, port) {
 function createDeepgramWS(onUtterance) {
   const params = new URLSearchParams({
     model: "nova-3",
-    language: "multi",
+    // language: "multi",
     encoding: "mulaw",
     sample_rate: "8000",
     channels: "1",
@@ -211,10 +211,19 @@ function createDeepgramWS(onUtterance) {
   ws.on("message", (raw) => {
     try {
       const data = JSON.parse(raw.toString());
+
+      if (data.is_final) console.log("🔍 Deepgram raw:", JSON.stringify(data.channel?.alternatives?.[0]).slice(0, 200));
       const txt = data.channel?.alternatives?.[0]?.transcript?.trim();
-      const detectedLang =
-        data.channel?.detected_language ||
-        data.channel?.alternatives?.[0]?.languages?.[0];
+     
+     
+      // const detectedLang =
+      //   data.channel?.detected_language ||
+      //   data.channel?.alternatives?.[0]?.languages?.[0];
+
+      const detectedLang = data.channel?.alternatives?.[0]?.languages?.[0] || "en";
+
+
+      console.log("🌍 detectedLang:", detectedLang, typeof detectedLang);
 
       if (!txt) return;
       if (txt.length < 2) return;
@@ -380,7 +389,7 @@ async function respondToUser(
           ? "Arabic"
           : "English";
     const stream = await openai.chat.completions.create({
-      model: "gpt-4.1-mini",
+      model: "gpt-4o-mini",
       stream: true,
       max_tokens: 120,
       temperature: 0.6,
@@ -684,7 +693,7 @@ srf.invite(async (req, res) => {
       );
     });
   } catch (e) {
-    console.error("❌ Call error:", e.message);
+    console.error("❌ Call error:", e.message, e.stack); 
 
     await CallLog.findOneAndUpdate({ callId }, { status: "failed" }).catch(
       () => {},
