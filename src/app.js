@@ -1,51 +1,51 @@
-import express from "express"
-import cors from "cors"
-import cookieParser from "cookie-parser"
+import express from "express";
+import cors from "cors";
+import cookieParser from "cookie-parser";
 
-const app = express()
+const app = express();
 
-app.use(cors({
+app.use(
+  cors({
     credentials: true,
-    origin: process.env.CORS_ORIGIN,
-}))
+    origin: [
+      process.env.CORS_ORIGIN,
+      "http://localhost:5173",
+      "https://localhost:5173",
+    ],
+  }),
+);
 
-
-app.use(cookieParser())
-app.use(express.json({limit: "16kb"}))
-app.use(express.urlencoded({limit: "16kb", extended: true}))
-app.use(express.static("public"))
-
+app.use(cookieParser());
+app.use(express.json({ limit: "16kb" }));
+app.use(express.urlencoded({ limit: "16kb", extended: true }));
+app.use(express.static("public"));
 
 // Routes for the Controllers
 
-import userRoutes from "./routes/user.routes.js"
-import extensionRoutes from "./routes/extension.routes.js"
-import callRoutes from "./routes/call.routes.js"
+import userRoutes from "./routes/user.routes.js";
+import extensionRoutes from "./routes/extension.routes.js";
+import callRoutes from "./routes/call.routes.js";
 
-app.use("/api/v1/users", userRoutes)
-app.use("/api/v1/sip", extensionRoutes)
+app.use("/api/v1/users", userRoutes);
+app.use("/api/v1/sip", extensionRoutes);
 app.use("/api/v1/calls", callRoutes);
 
-
-
 app.use((req, res) => {
-    res.status(404).json({
-        success: false,
-        message: "Route not found"
-    });
+  res.status(404).json({
+    success: false,
+    message: "Route not found",
+  });
 });
-
 
 app.use((err, req, res, next) => {
-    console.error(err); // optional logging
-    const statusCode = err.statusCode || 500;
-    res.status(statusCode).json({
-        statusCode,
-        success: false,
-        message: err.message || "Internal Server Error",
-        data: null
-    });
+  console.error(err); // optional logging
+  const statusCode = err.statusCode || 500;
+  res.status(statusCode).json({
+    statusCode,
+    success: false,
+    message: err.message || "Internal Server Error",
+    data: null,
+  });
 });
 
-
-export {app}
+export { app };

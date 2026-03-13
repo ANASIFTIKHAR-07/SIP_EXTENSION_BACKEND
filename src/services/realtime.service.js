@@ -492,7 +492,7 @@ async function handleCall(localRtpPort, remote, callMeta) {
   const INTERRUPT_THRESHOLD = 50;
   const INTERRUPT_PACKETS = 5;
 
-  const dg = await createDeepgramWS(async (transcript) => {
+  const dg = await createDeepgramWS(async (transcript, detectedLang) => {
     if (!transcript) return;
 
     // Check bot-enabled flag from activeCalls map (can be toggled via API)
