@@ -188,15 +188,16 @@ function createRtpSender(sendSock, host, port) {
 function createDeepgramWS(onUtterance) {
   const params = new URLSearchParams({
     model: "nova-3",
+    language: "multi",
     encoding: "mulaw",
     sample_rate: "8000",
     channels: "1",
     detect_language: "true",
     interim_results: "true",
-    endpointing: "300",
-    utterance_end_ms: "800",
+    endpointing: "400",
+    utterance_end_ms: "1200",
     smart_format: "true",
-    punctuate: "true"
+    punctuate: "true",
   });
 
   const ws = new WebSocket(`wss://api.deepgram.com/v1/listen?${params}`, {
@@ -211,16 +212,17 @@ function createDeepgramWS(onUtterance) {
     try {
       const data = JSON.parse(raw.toString());
       const txt = data.channel?.alternatives?.[0]?.transcript?.trim();
-      const detectedLang = data.channel?.detected_language;
+      const detectedLang =
+        data.channel?.detected_language ||
+        data.channel?.alternatives?.[0]?.languages?.[0];
 
       if (!txt) return;
       if (txt.length < 2) return;
 
-
       if (data.is_final) {
         process.stdout.write(`\r📝 [FINAL ${detectedLang || ""}] ${txt}\n`);
 
-        if (data.speech_final) onUtterance(txt);
+        if (data.speech_final) onUtterance(txt, detectedLang);
       } else {
         process.stdout.write(
           `\r📝 [live ${detectedLang || ""}] ${txt}          `,
@@ -347,6 +349,7 @@ function createDeepgramWS(onUtterance) {
 // Updated Version
 async function respondToUser(
   transcript,
+  detectedLang,
   history,
   rtpSock,
   remote,
@@ -370,10 +373,16 @@ async function respondToUser(
   console.log(`📤 Will send audio → ${remote.ip}:${remote.port}`);
 
   try {
+    const langLabel =
+      detectedLang === "ur"
+        ? "Urdu"
+        : detectedLang === "ar"
+          ? "Arabic"
+          : "English";
     const stream = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
+      model: "gpt-4.1-mini",
       stream: true,
-      max_tokens: 60,
+      max_tokens: 120,
       temperature: 0.6,
       messages: [
         {
@@ -381,8 +390,8 @@ async function respondToUser(
           content: `
           You are a helpful AI voice assistant on a phone call.
 
-          The caller may speak English, Urdu, or Arabic.
-          Always respond in the SAME language the user speaks.
+          The caller is speaking ${langLabel}.
+          You MUST respond in ${langLabel} only. Do not switch languages.
 
           Rules:
           - Keep responses short (1–2 sentences)
@@ -407,7 +416,7 @@ async function respondToUser(
       try {
         const res = await openai.audio.speech.create({
           model: "tts-1",
-          voice: "verse",
+          voice: "alloy",
           input: text,
           response_format: "pcm",
           speed: 1.0,
@@ -498,6 +507,7 @@ async function handleCall(localRtpPort, remote, callMeta) {
 
     await respondToUser(
       transcript,
+      detectedLang,
       history,
       rtpSock,
       actualRemote,
