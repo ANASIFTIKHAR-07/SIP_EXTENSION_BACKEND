@@ -212,16 +212,23 @@ function createDeepgramWS(onUtterance) {
     try {
       const data = JSON.parse(raw.toString());
 
-      if (data.is_final) console.log("🔍 Deepgram raw:", JSON.stringify(data.channel?.alternatives?.[0]).slice(0, 200));
+      if (data.is_final)
+        console.log(
+          "🔍 Deepgram raw:",
+          JSON.stringify(data.channel?.alternatives?.[0]).slice(0, 200),
+        );
       const txt = data.channel?.alternatives?.[0]?.transcript?.trim();
-     
-     
+
       // const detectedLang =
       //   data.channel?.detected_language ||
       //   data.channel?.alternatives?.[0]?.languages?.[0];
 
-      const detectedLang = data.channel?.alternatives?.[0]?.languages?.[0] || "en";
+      // const detectedLang = data.channel?.alternatives?.[0]?.languages?.[0] || "en";
 
+      const detectedLang =
+        data.channel?.detected_language ||
+        data.channel?.alternatives?.[0]?.languages?.[0]?.language ||
+        "en";
 
       console.log("🌍 detectedLang:", detectedLang, typeof detectedLang);
 
@@ -693,7 +700,7 @@ srf.invite(async (req, res) => {
       );
     });
   } catch (e) {
-    console.error("❌ Call error:", e.message, e.stack); 
+    console.error("❌ Call error:", e.message, e.stack);
 
     await CallLog.findOneAndUpdate({ callId }, { status: "failed" }).catch(
       () => {},
