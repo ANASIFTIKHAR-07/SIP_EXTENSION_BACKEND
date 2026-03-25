@@ -7,6 +7,8 @@ import {
     unregisterSipExtension,
     getAllExtensionStatus,
     getExtensionStatus,
+    assignAgent,
+    unassignAgent,
 } from "../controllers/extension.controller.js";
 import { verifyJWT } from "../middlewares/auth.middleware.js";
 
@@ -26,5 +28,8 @@ router.route("/unregister").post(unregisterSipExtension);
 // Status
 router.route("/status").get(getAllExtensionStatus);
 router.route("/status/:extension").get(getExtensionStatus);
+
+// Agent assignment
+router.route("/:id/agent").patch(assignAgent).delete(unassignAgent);
 
 export default router;

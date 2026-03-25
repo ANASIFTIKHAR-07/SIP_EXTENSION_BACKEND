@@ -1,4 +1,5 @@
 import { SipExtension } from "../models/extension.model.js";
+import { AIAgent } from "../models/aiagent.model.js";
 import { ApiError } from "../utils/ApiError.js";
 import { ApiResponse } from "../utils/ApiResponse.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
@@ -223,6 +224,51 @@ const getExtensionStatus = asyncHandler(async (req, res) => {
         .json(new ApiResponse(200, ext, "Extension status fetched"));
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// PATCH /api/v1/sip/:id/agent
+// Assign an AI agent to an extension
+// Body: { agentId }
+// ─────────────────────────────────────────────────────────────────────────────
+const assignAgent = asyncHandler(async (req, res) => {
+    const { id } = req.params;
+    const { agentId } = req.body;
+
+    if (!agentId) throw new ApiError(400, "agentId is required");
+
+    const [ext, agent] = await Promise.all([
+        SipExtension.findOne({ _id: id, createdBy: req.user._id }),
+        AIAgent.findOne({ _id: agentId, createdBy: req.user._id }),
+    ]);
+
+    if (!ext)   throw new ApiError(404, "Extension not found or unauthorized");
+    if (!agent) throw new ApiError(404, "Agent not found or unauthorized");
+
+    ext.aiAgent = agent._id;
+    await ext.save();
+
+    return res
+        .status(200)
+        .json(new ApiResponse(200, { extension: ext.extension, agentId: agent._id, agentName: agent.name }, "Agent assigned to extension"));
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DELETE /api/v1/sip/:id/agent
+// Remove the AI agent assignment from an extension
+// ─────────────────────────────────────────────────────────────────────────────
+const unassignAgent = asyncHandler(async (req, res) => {
+    const { id } = req.params;
+
+    const ext = await SipExtension.findOne({ _id: id, createdBy: req.user._id });
+    if (!ext) throw new ApiError(404, "Extension not found or unauthorized");
+
+    ext.aiAgent = null;
+    await ext.save();
+
+    return res
+        .status(200)
+        .json(new ApiResponse(200, { extension: ext.extension, agentId: null }, "Agent unassigned from extension"));
+});
+
 export {
     getAllSipExtensions,
     createSipExtension,
@@ -231,4 +277,6 @@ export {
     unregisterSipExtension,
     getAllExtensionStatus,
     getExtensionStatus,
+    assignAgent,
+    unassignAgent,
 };

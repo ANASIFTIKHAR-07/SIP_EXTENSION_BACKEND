@@ -34,6 +34,11 @@ const sipExtensionSchema = new mongoose.Schema(
             ref: "User",
             required: true,
         },
+        aiAgent: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "AIAgent",
+            default: null,
+        },
     },
     { timestamps: true }
 );
