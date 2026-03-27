@@ -14,6 +14,7 @@ import { activeCalls } from "../controllers/call.controller.js";
 import { CallLog } from "../models/calllog.model.js";
 import { SipExtension } from "../models/extension.model.js";
 import { AIAgent } from "../models/aiagent.model.js";
+import { RagContext } from "../models/ragcontext.model.js";
 
 export const srf = new Srf();
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -367,6 +368,7 @@ async function respondToUser(
   isInterrupted,
   isBotEnabled,
   agentConfig,   // { systemPrompt, modelName } from AIAgent doc (optional)
+  ragText,       // extracted text from active RagContext (optional)
 ) {
   // Respect bot-enabled flag set via API
   if (!isBotEnabled()) {
@@ -397,7 +399,11 @@ async function respondToUser(
 Keep answers SHORT — 1 to 2 sentences. Be natural and conversational.`;
 
     // Append multilanguage instruction (always enforced)
-    const systemContent = `${basePrompt}
+    const ragSection = ragText
+      ? `\n\nKNOWLEDGE BASE — use this as your primary source of truth when answering:\n"""\n${ragText}\n"""\nOnly answer based on the above context. If the answer is not in the context, politely say you don't have that information.`
+      : "";
+
+    const systemContent = `${basePrompt}${ragSection}
 
 IMPORTANT: Always reply in the SAME language the user is speaking.
 - If user speaks Urdu → reply in Urdu (Urdu script)
@@ -480,7 +486,7 @@ IMPORTANT: Always reply in the SAME language the user is speaking.
 }
 
 // ── Call Handler ──────────────────────────────────────────────────────────────
-async function handleCall(localRtpPort, remote, callMeta, agentConfig) {
+async function handleCall(localRtpPort, remote, callMeta, agentConfig, ragText) {
   const history = [];
   let currentSender = null;
   let botSpeaking = false;
@@ -538,6 +544,7 @@ async function handleCall(localRtpPort, remote, callMeta, agentConfig) {
       () => interrupted,
       isBotEnabled,
       agentConfig,
+      ragText,
     );
 
     processing = false;
@@ -657,7 +664,12 @@ srf.invite(async (req, res) => {
       console.log(`🤖 Using agent: ${extDoc.aiAgent.name} (${agentConfig.modelName})`);
     }
 
-    const session = await handleCall(port, remote, callMeta, agentConfig);
+    // Fetch active RAG context (global, not per-extension)
+    const ragDoc = await RagContext.findOne({ isActive: true }).select("extractedText fileName");
+    const ragText = ragDoc?.extractedText || null;
+    if (ragText) console.log(`📄 RAG context loaded: "${ragDoc.fileName}" (${ragText.length} chars)`);
+
+    const session = await handleCall(port, remote, callMeta, agentConfig, ragText);
 
     // ── Log to DB + in-memory ──────────────────────────────────────────────
     await CallLog.create({
