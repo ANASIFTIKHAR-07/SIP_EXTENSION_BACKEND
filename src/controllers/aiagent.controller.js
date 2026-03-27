@@ -2,6 +2,8 @@ import { AIAgent } from "../models/aiagent.model.js";
 import { ApiError } from "../utils/ApiError.js";
 import { ApiResponse } from "../utils/ApiResponse.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
+import fs from "fs";
+import path from "path";
 
 // GET /api/v1/ai-agents
 const getAllAgents = asyncHandler(async (req, res) => {
@@ -62,17 +64,24 @@ const deleteAgent = asyncHandler(async (req, res) => {
 });
 
 // POST /api/v1/ai-agents/:id/rag-files
-// Adds a RAG file reference (fileName + fileUrl) to an agent
 const addRagFile = asyncHandler(async (req, res) => {
   const { id } = req.params;
-  const { fileName, fileUrl } = req.body;
 
-  if (!fileName || !fileUrl) throw new ApiError(400, "fileName and fileUrl are required");
+  console.log("File upload request:", { file: req.file, body: req.body });
+
+  if (!req.file) throw new ApiError(400, "File is required");
 
   const agent = await AIAgent.findOne({ _id: id, createdBy: req.user._id });
   if (!agent) throw new ApiError(404, "Agent not found or unauthorized");
 
-  agent.ragFiles.push({ fileName, fileUrl });
+  const fileUrl = `/uploads/${req.file.filename}`;
+  const fileContent = fs.readFileSync(req.file.path, "utf-8");
+
+  agent.ragFiles.push({ 
+    fileName: req.file.originalname, 
+    fileUrl,
+    content: fileContent
+  });
   await agent.save();
 
   return res.status(200).json(new ApiResponse(200, agent, "RAG file added successfully"));
@@ -84,6 +93,12 @@ const removeRagFile = asyncHandler(async (req, res) => {
 
   const agent = await AIAgent.findOne({ _id: id, createdBy: req.user._id });
   if (!agent) throw new ApiError(404, "Agent not found or unauthorized");
+
+  const file = agent.ragFiles.find((f) => f._id.toString() === fileId);
+  if (file && file.fileUrl) {
+    const filePath = path.join(process.cwd(), file.fileUrl);
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+  }
 
   agent.ragFiles = agent.ragFiles.filter((f) => f._id.toString() !== fileId);
   await agent.save();

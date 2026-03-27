@@ -23,8 +23,10 @@
     "jsonwebtoken": "^9.0.3",
     "mongoose": "^9.2.3",
     "mongoose-aggregate-paginate-v2": "^1.1.4",
+    "multer": "^2.1.1",
     "openai": "^6.27.0",
     "rtpengine-client": "^0.4.12",
+    "tiktoken": "^1.0.22",
     "uuid": "^11.0.3",
     "ws": "^8.19.0"
   }

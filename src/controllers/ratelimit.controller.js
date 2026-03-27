@@ -22,9 +22,8 @@ const getAllRateLimits = asyncHandler(async (req, res) => {
       config: limit
         ? {
             _id: limit._id,
-            maxTokensPerCall: limit.maxTokensPerCall,
-            maxTokensPerMinute: limit.maxTokensPerMinute,
-            maxTokensPerHour: limit.maxTokensPerHour,
+            chatgpt: limit.chatgpt,
+            deepgram: limit.deepgram,
             warningThreshold: limit.warningThreshold,
           }
         : null,
@@ -50,7 +49,7 @@ const getRateLimit = asyncHandler(async (req, res) => {
 // Upsert rate limit config for a specific extension
 const upsertRateLimit = asyncHandler(async (req, res) => {
   const { extensionId } = req.params;
-  const { maxTokensPerCall, maxTokensPerMinute, maxTokensPerHour, warningThreshold } = req.body;
+  const { chatgpt, deepgram, warningThreshold } = req.body;
 
   const ext = await SipExtension.findOne({ _id: extensionId, createdBy: req.user._id });
   if (!ext) throw new ApiError(404, "Extension not found or unauthorized");
@@ -59,9 +58,8 @@ const upsertRateLimit = asyncHandler(async (req, res) => {
     { extensionId },
     {
       extensionId,
-      maxTokensPerCall: maxTokensPerCall ?? 1000,
-      maxTokensPerMinute: maxTokensPerMinute ?? 5000,
-      maxTokensPerHour: maxTokensPerHour ?? 50000,
+      chatgpt: chatgpt || { maxTokensPerCall: 1000, maxTokensPerMinute: 5000, maxTokensPerHour: 50000 },
+      deepgram: deepgram || { maxTokensPerCall: 1000, maxTokensPerMinute: 5000, maxTokensPerHour: 50000 },
       warningThreshold: warningThreshold ?? 80,
       createdBy: req.user._id,
     },
