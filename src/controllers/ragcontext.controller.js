@@ -1,7 +1,4 @@
 import { v2 as cloudinary } from "cloudinary";
-import { createRequire } from "module";
-const require = createRequire(import.meta.url);
-const pdfParse = require("pdf-parse");
 import { RagContext } from "../models/ragcontext.model.js";
 import { ApiError } from "../utils/ApiError.js";
 import { ApiResponse } from "../utils/ApiResponse.js";
@@ -25,6 +22,11 @@ const uploadRagFile = asyncHandler(async (req, res) => {
 
   let extractedText = "";
   if (mimetype === "application/pdf") {
+    // Dynamically require pdf-parse ONLY on upload to prevent fatal crashes and DOMMatrix/Canvas polyfill warnings on server startup in Node 18/Ubuntu
+    const { createRequire } = await import("module");
+    const require = createRequire(import.meta.url);
+    const pdfParse = require("pdf-parse");
+    
     const parsed = await pdfParse(buffer);
     extractedText = parsed.text;
   } else {
