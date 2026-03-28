@@ -278,17 +278,16 @@ function createRtpSender(sendSock, host, port) {
 //   });
 // }
 
-// ✅ nova-3 + language=ur + UtteranceEnd dual-trigger (fixes "transcribes but never responds")
 function createDeepgramWS(onUtterance) {
   const params = new URLSearchParams({
-    model:            "nova-3",
-    language:         "ur",       // explicit Urdu — prevents Hindi confusion
-    encoding:         "mulaw",
-    sample_rate:      "8000",
-    channels:         "1",
-    endpointing:      "500",
-    interim_results:  "true",
-    utterance_end_ms: "1500",     // silence timeout fallback trigger
+    model: "nova-3",
+    language: "ur",       
+    encoding: "mulaw",
+    sample_rate: "8000",
+    channels: "1",
+    endpointing: "500",
+    interim_results: "true",
+    utterance_end_ms: "1500",     
   });
 
   const url = `wss://api.deepgram.com/v1/listen?${params}`;
@@ -298,7 +297,7 @@ function createDeepgramWS(onUtterance) {
     headers: { Authorization: `Token ${DEEPGRAM_KEY}` },
   });
 
-  ws.on("open",  () => console.log("🟢 Deepgram connected (Urdu / nova-3)"));
+  ws.on("open", () => console.log("🟢 Deepgram connected (Urdu / nova-3)"));
   ws.on("error", (e) => console.error("❌ Deepgram error:", e.message));
   ws.on("close", (c, reason) => console.log(`🔴 Deepgram closed (${c}) ${reason}`));
 
@@ -335,14 +334,14 @@ function createDeepgramWS(onUtterance) {
       } else {
         process.stdout.write(`\r📝 [live]  ${txt}          `);
       }
-    } catch (_) {}
+    } catch (_) { }
   });
 
   return new Promise((resolve, reject) => {
     ws.once("open", () =>
       resolve({
-        send:  (buf) => { if (ws.readyState === WebSocket.OPEN) ws.send(buf); },
-        close: ()    => { try { ws.close(); } catch (_) {} },
+        send: (buf) => { if (ws.readyState === WebSocket.OPEN) ws.send(buf); },
+        close: () => { try { ws.close(); } catch (_) { } },
       }),
     );
     ws.once("error", reject);
@@ -463,6 +462,7 @@ async function respondToUser(
   rateLimitConfig,    // { maxTokensPerCall, maxTokensPerMinute, maxTokensPerHour, warningThreshold } (optional)
   callId,             // for per-call token tracking
   extensionId,        // for per-extension rate limiting
+  onSpeak,            // callback fired exactly when audio starts playing
 ) {
   // Respect bot-enabled flag set via API
   if (!isBotEnabled()) {
@@ -578,8 +578,10 @@ IMPORTANT: Always reply in the SAME language the user is speaking.
         console.log(
           `🔊 Streaming ${mulaw.length} bytes (${Math.ceil(mulaw.length / 160)} packets) → ${remote.ip}:${remote.port}`,
         );
-        if (!isInterrupted() && isBotEnabled())
+        if (!isInterrupted() && isBotEnabled()) {
+          if (onSpeak) onSpeak();
           await sender.streamBuffer(mulaw);
+        }
       } catch (e) {
         console.error("❌ TTS error:", e.message);
       }
@@ -674,7 +676,7 @@ async function handleCall(localRtpPort, remote, callMeta, agentConfig, ragText, 
       actualRemote,
       (s) => {
         currentSender = s;
-        botSpeaking = true;
+        // Do NOT set botSpeaking = true here! Wait until TTS actually finishes generating audio.
         // Expose sender to API for stop-bot
         if (callEntry) callEntry.currentSender = s;
       },
@@ -690,6 +692,10 @@ async function handleCall(localRtpPort, remote, callMeta, agentConfig, ragText, 
       rateLimitConfig,
       callMeta.callId,
       extensionId,
+      () => {
+        // Fired instantly before the first RTP bits are sent across the wire
+        botSpeaking = true;
+      }
     );
     // Note: processing is reset to false inside onDone() callback above
   });
@@ -738,7 +744,7 @@ async function handleCall(localRtpPort, remote, callMeta, agentConfig, ragText, 
       dg.close();
       try {
         rtpSock.close();
-      } catch (_) {}
+      } catch (_) { }
       if (currentSender) currentSender.stop();
     },
   };
@@ -823,19 +829,19 @@ srf.invite(async (req, res) => {
       const rlDoc = await RateLimit.findOne({ extensionId });
       if (rlDoc) {
         rateLimitConfig = {
-          maxTokensPerCall:   rlDoc.maxTokensPerCall,
+          maxTokensPerCall: rlDoc.maxTokensPerCall,
           maxTokensPerMinute: rlDoc.maxTokensPerMinute,
-          maxTokensPerHour:   rlDoc.maxTokensPerHour,
-          warningThreshold:   rlDoc.warningThreshold,
+          maxTokensPerHour: rlDoc.maxTokensPerHour,
+          warningThreshold: rlDoc.warningThreshold,
         };
         console.log(`🔒 Rate limit loaded: ${rlDoc.maxTokensPerCall}/call, ${rlDoc.maxTokensPerMinute}/min, ${rlDoc.maxTokensPerHour}/hr`);
       } else {
         // No saved config — apply schema defaults (1000/call, 5000/min, 50000/hr)
         rateLimitConfig = {
-          maxTokensPerCall:   1000,
+          maxTokensPerCall: 1000,
           maxTokensPerMinute: 5000,
-          maxTokensPerHour:   50000,
-          warningThreshold:   80,
+          maxTokensPerHour: 50000,
+          warningThreshold: 80,
         };
         console.log(`🔒 No rate limit row found — applying defaults: 1000/call, 5000/min, 50000/hr`);
       }
@@ -902,13 +908,13 @@ srf.invite(async (req, res) => {
     console.error("❌ Call error:", e.message, e.stack);
 
     await CallLog.findOneAndUpdate({ callId }, { status: "failed" }).catch(
-      () => {},
+      () => { },
     );
     activeCalls.delete(callId);
 
     try {
       res.send(500);
-    } catch (_) {}
+    } catch (_) { }
   }
 });
 
