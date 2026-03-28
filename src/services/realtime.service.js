@@ -16,6 +16,7 @@ import { SipExtension } from "../models/extension.model.js";
 import { AIAgent } from "../models/aiagent.model.js";
 import { RagContext } from "../models/ragcontext.model.js";
 import { RateLimit } from "../models/ratelimit.model.js";
+
 export const srf = new Srf();
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -502,10 +503,9 @@ async function respondToUser(
 
   history.push({ role: "user", content: transcript });
 
-  // Estimate input tokens (system prompt + history + user msg)
-  const inputTokenEstimate = estimateTokens(
-    history.map((m) => m.content).join(" ")
-  );
+  // Estimate tokens for THIS turn only (new user message)
+  // Do NOT sum the full history — that double-counts every previous turn
+  const inputTokenEstimate = estimateTokens(transcript);
   if (rateLimitConfig && callId && extensionId) {
     tokenTracker.addTokens(callId, extensionId, inputTokenEstimate);
     console.log(`📊 Input tokens ~${inputTokenEstimate} | Call total: ${tokenTracker.getUsage(callId, extensionId).callTokens}`);
@@ -691,8 +691,7 @@ async function handleCall(localRtpPort, remote, callMeta, agentConfig, ragText, 
       callMeta.callId,
       extensionId,
     );
-
-    processing = false;
+    // Note: processing is reset to false inside onDone() callback above
   });
 
   rtpSock.on("message", (msg, rinfo) => {
@@ -809,26 +808,36 @@ srf.invite(async (req, res) => {
       console.log(`🤖 Using agent: ${extDoc.aiAgent.name} (${agentConfig.modelName})`);
     }
 
-    // Fetch active RAG context (global, not per-extension)
-    const ragDoc = await RagContext.findOne({ isActive: true }).select("extractedText fileName");
+    // Fetch active RAG context — scoped to this extension's owner to prevent cross-user leakage
+    const ownerId = extDoc?.createdBy ?? null;
+    const ragDoc = await RagContext.findOne({ isActive: true, uploadedBy: ownerId }).select("extractedText fileName");
     const ragText = ragDoc?.extractedText || null;
     if (ragText) console.log(`📄 RAG context loaded: "${ragDoc.fileName}" (${ragText.length} chars)`);
+    if (!ragText && ownerId) console.log("📄 No active RAG context for this extension's owner");
 
     // Fetch token rate limit config for this extension
+    // If no DB row exists, apply schema defaults so limits are always enforced
     let rateLimitConfig = null;
     const extensionId = extDoc?._id || null;
     if (extensionId) {
       const rlDoc = await RateLimit.findOne({ extensionId });
       if (rlDoc) {
         rateLimitConfig = {
-          maxTokensPerCall:    rlDoc.maxTokensPerCall,
-          maxTokensPerMinute:  rlDoc.maxTokensPerMinute,
-          maxTokensPerHour:    rlDoc.maxTokensPerHour,
-          warningThreshold:    rlDoc.warningThreshold,
+          maxTokensPerCall:   rlDoc.maxTokensPerCall,
+          maxTokensPerMinute: rlDoc.maxTokensPerMinute,
+          maxTokensPerHour:   rlDoc.maxTokensPerHour,
+          warningThreshold:   rlDoc.warningThreshold,
         };
         console.log(`🔒 Rate limit loaded: ${rlDoc.maxTokensPerCall}/call, ${rlDoc.maxTokensPerMinute}/min, ${rlDoc.maxTokensPerHour}/hr`);
       } else {
-        console.log(`🔓 No rate limit configured for extension ${toNum}`);
+        // No saved config — apply schema defaults (1000/call, 5000/min, 50000/hr)
+        rateLimitConfig = {
+          maxTokensPerCall:   1000,
+          maxTokensPerMinute: 5000,
+          maxTokensPerHour:   50000,
+          warningThreshold:   80,
+        };
+        console.log(`🔒 No rate limit row found — applying defaults: 1000/call, 5000/min, 50000/hr`);
       }
     }
 
