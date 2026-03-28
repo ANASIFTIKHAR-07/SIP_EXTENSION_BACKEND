@@ -15,7 +15,7 @@ import { CallLog } from "../models/calllog.model.js";
 import { SipExtension } from "../models/extension.model.js";
 import { AIAgent } from "../models/aiagent.model.js";
 import { RagContext } from "../models/ragcontext.model.js";
-
+import { RateLimit } from "../models/ratelimit.model.js";
 export const srf = new Srf();
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -35,6 +35,96 @@ function getFreePort() {
   usedPorts.add(port);
   return port;
 }
+
+// ── Token Rate Limiting ──────────────────────────────────────────────────────
+function estimateTokens(text) {
+  if (!text) return 0;
+  return Math.ceil(text.length / 4);
+}
+
+class TokenTracker {
+  constructor() {
+    // Per-call counters: Map<callId, number>
+    this.perCall = new Map();
+    // Sliding window entries: Array<{ extensionId, tokens, timestamp }>
+    this.history = [];
+  }
+
+  /**
+   * Record token usage for a call + extension.
+   */
+  addTokens(callId, extensionId, count) {
+    this.perCall.set(callId, (this.perCall.get(callId) || 0) + count);
+    this.history.push({ extensionId, tokens: count, timestamp: Date.now() });
+    // Prune entries older than 1 hour
+    const oneHourAgo = Date.now() - 60 * 60 * 1000;
+    this.history = this.history.filter((e) => e.timestamp > oneHourAgo);
+  }
+
+  /**
+   * Get current usage for a call + extension.
+   */
+  getUsage(callId, extensionId) {
+    const now = Date.now();
+    const callTokens = this.perCall.get(callId) || 0;
+    const oneMinAgo = now - 60 * 1000;
+    const oneHourAgo = now - 60 * 60 * 1000;
+
+    let minuteTokens = 0;
+    let hourTokens = 0;
+    for (const entry of this.history) {
+      if (entry.extensionId !== extensionId) continue;
+      if (entry.timestamp > oneMinAgo) minuteTokens += entry.tokens;
+      if (entry.timestamp > oneHourAgo) hourTokens += entry.tokens;
+    }
+
+    return { callTokens, minuteTokens, hourTokens };
+  }
+
+  /**
+   * Check if a request can proceed given the rate limit config.
+   * Returns { allowed: boolean, reason?: string, usage }
+   */
+  canProceed(callId, extensionId, rateLimitConfig) {
+    if (!rateLimitConfig) return { allowed: true, reason: null, usage: null };
+
+    const usage = this.getUsage(callId, extensionId);
+    const { maxTokensPerCall, maxTokensPerMinute, maxTokensPerHour, warningThreshold } = rateLimitConfig;
+
+    // Check per-call limit
+    if (maxTokensPerCall > 0 && usage.callTokens >= maxTokensPerCall) {
+      return { allowed: false, reason: `Per-call limit reached (${usage.callTokens}/${maxTokensPerCall})`, usage };
+    }
+    // Check per-minute limit
+    if (maxTokensPerMinute > 0 && usage.minuteTokens >= maxTokensPerMinute) {
+      return { allowed: false, reason: `Per-minute limit reached (${usage.minuteTokens}/${maxTokensPerMinute})`, usage };
+    }
+    // Check per-hour limit
+    if (maxTokensPerHour > 0 && usage.hourTokens >= maxTokensPerHour) {
+      return { allowed: false, reason: `Per-hour limit reached (${usage.hourTokens}/${maxTokensPerHour})`, usage };
+    }
+
+    // Log warning if approaching threshold
+    if (warningThreshold > 0 && maxTokensPerCall > 0) {
+      const pct = (usage.callTokens / maxTokensPerCall) * 100;
+      if (pct >= warningThreshold) {
+        console.warn(`⚠️  Token usage at ${pct.toFixed(0)}% of per-call limit (${usage.callTokens}/${maxTokensPerCall})`);
+      }
+    }
+
+    return { allowed: true, reason: null, usage };
+  }
+
+  /**
+   * Remove per-call data when call ends.
+   */
+  clearCall(callId) {
+    this.perCall.delete(callId);
+  }
+}
+
+const tokenTracker = new TokenTracker();
+
 
 function parseRemoteRtp(sdp) {
   const ip = (sdp.match(/^c=IN IP4 (.+)$/m) || [])[1]?.trim();
@@ -356,7 +446,7 @@ function createDeepgramWS(onUtterance) {
 //   console.log("\n🎙️  Listening...");
 // }
 
-// Updated Version
+// Updated Version — with token rate limiting
 async function respondToUser(
   transcript,
   detectedLang,
@@ -367,8 +457,11 @@ async function respondToUser(
   onDone,
   isInterrupted,
   isBotEnabled,
-  agentConfig,   // { systemPrompt, modelName } from AIAgent doc (optional)
-  ragText,       // extracted text from active RagContext (optional)
+  agentConfig,        // { systemPrompt, modelName } from AIAgent doc (optional)
+  ragText,            // extracted text from active RagContext (optional)
+  rateLimitConfig,    // { maxTokensPerCall, maxTokensPerMinute, maxTokensPerHour, warningThreshold } (optional)
+  callId,             // for per-call token tracking
+  extensionId,        // for per-extension rate limiting
 ) {
   // Respect bot-enabled flag set via API
   if (!isBotEnabled()) {
@@ -377,7 +470,46 @@ async function respondToUser(
   }
 
   console.log(`\n💬 User: ${transcript}`);
+
+  // ── Token rate limit check ────────────────────────────────────────────────
+  if (rateLimitConfig && callId && extensionId) {
+    const check = tokenTracker.canProceed(callId, extensionId, rateLimitConfig);
+    if (!check.allowed) {
+      console.log(`🚫 Token limit blocked: ${check.reason}`);
+      // TTS a polite apology instead of calling GPT
+      const sender = createRtpSender(rtpSock, remote.ip, remote.port);
+      onStart(sender);
+      try {
+        const apologyText = detectedLang === "ur"
+          ? "معذرت، اس کال کے لیے ٹوکن کی حد پوری ہو چکی ہے۔"
+          : "I'm sorry, the usage limit has been reached for this session.";
+        console.log(`🗣️  TTS (limit apology): "${apologyText}"`);
+        const res = await openai.audio.speech.create({
+          model: "tts-1", voice: "alloy", input: apologyText,
+          response_format: "pcm", speed: 1.0,
+        });
+        const pcm = Buffer.from(await res.arrayBuffer());
+        const mulaw = pcm24kToMulaw8k(pcm);
+        await sender.streamBuffer(mulaw);
+      } catch (e) {
+        console.error("❌ Limit-apology TTS error:", e.message);
+      }
+      sender.stop();
+      onDone();
+      return;
+    }
+  }
+
   history.push({ role: "user", content: transcript });
+
+  // Estimate input tokens (system prompt + history + user msg)
+  const inputTokenEstimate = estimateTokens(
+    history.map((m) => m.content).join(" ")
+  );
+  if (rateLimitConfig && callId && extensionId) {
+    tokenTracker.addTokens(callId, extensionId, inputTokenEstimate);
+    console.log(`📊 Input tokens ~${inputTokenEstimate} | Call total: ${tokenTracker.getUsage(callId, extensionId).callTokens}`);
+  }
 
   const sender = createRtpSender(rtpSock, remote.ip, remote.port);
   onStart(sender);
@@ -453,11 +585,14 @@ IMPORTANT: Always reply in the SAME language the user is speaking.
       }
     }
 
+    let outputTokenCount = 0;
+
     for await (const chunk of stream) {
       if (isInterrupted() || !isBotEnabled()) break;
       const token = chunk.choices[0]?.delta?.content || "";
       fullReply += token;
       pending += token;
+      outputTokenCount += estimateTokens(token);
 
       if (/[.!?؟۔]\s/.test(pending)) {
         const parts = pending.split(/(?<=[.!?؟۔])\s+/);
@@ -467,6 +602,13 @@ IMPORTANT: Always reply in the SAME language the user is speaking.
         }
         pending = parts[parts.length - 1] || "";
       }
+    }
+
+    // Record output tokens
+    if (rateLimitConfig && callId && extensionId) {
+      tokenTracker.addTokens(callId, extensionId, outputTokenCount);
+      const usage = tokenTracker.getUsage(callId, extensionId);
+      console.log(`📊 Output tokens ~${outputTokenCount} | Call total: ${usage.callTokens} | Min: ${usage.minuteTokens} | Hr: ${usage.hourTokens}`);
     }
 
     if (!isInterrupted() && isBotEnabled() && pending.trim())
@@ -486,7 +628,7 @@ IMPORTANT: Always reply in the SAME language the user is speaking.
 }
 
 // ── Call Handler ──────────────────────────────────────────────────────────────
-async function handleCall(localRtpPort, remote, callMeta, agentConfig, ragText) {
+async function handleCall(localRtpPort, remote, callMeta, agentConfig, ragText, rateLimitConfig, extensionId) {
   const history = [];
   let currentSender = null;
   let botSpeaking = false;
@@ -545,6 +687,9 @@ async function handleCall(localRtpPort, remote, callMeta, agentConfig, ragText) 
       isBotEnabled,
       agentConfig,
       ragText,
+      rateLimitConfig,
+      callMeta.callId,
+      extensionId,
     );
 
     processing = false;
@@ -669,7 +814,25 @@ srf.invite(async (req, res) => {
     const ragText = ragDoc?.extractedText || null;
     if (ragText) console.log(`📄 RAG context loaded: "${ragDoc.fileName}" (${ragText.length} chars)`);
 
-    const session = await handleCall(port, remote, callMeta, agentConfig, ragText);
+    // Fetch token rate limit config for this extension
+    let rateLimitConfig = null;
+    const extensionId = extDoc?._id || null;
+    if (extensionId) {
+      const rlDoc = await RateLimit.findOne({ extensionId });
+      if (rlDoc) {
+        rateLimitConfig = {
+          maxTokensPerCall:    rlDoc.maxTokensPerCall,
+          maxTokensPerMinute:  rlDoc.maxTokensPerMinute,
+          maxTokensPerHour:    rlDoc.maxTokensPerHour,
+          warningThreshold:    rlDoc.warningThreshold,
+        };
+        console.log(`🔒 Rate limit loaded: ${rlDoc.maxTokensPerCall}/call, ${rlDoc.maxTokensPerMinute}/min, ${rlDoc.maxTokensPerHour}/hr`);
+      } else {
+        console.log(`🔓 No rate limit configured for extension ${toNum}`);
+      }
+    }
+
+    const session = await handleCall(port, remote, callMeta, agentConfig, ragText, rateLimitConfig, extensionId?.toString());
 
     // ── Log to DB + in-memory ──────────────────────────────────────────────
     await CallLog.create({
@@ -703,6 +866,13 @@ srf.invite(async (req, res) => {
       console.log("📵 Call ended");
       session.stop();
       usedPorts.delete(port);
+
+      // ── Clean up token tracker ─────────────────────────────────────────
+      const finalUsage = tokenTracker.getUsage(callId, extensionId?.toString());
+      if (finalUsage.callTokens > 0) {
+        console.log(`📊 Final token usage for call ${callId}: ${finalUsage.callTokens} tokens`);
+      }
+      tokenTracker.clearCall(callId);
 
       // ── Update DB + remove from active map ─────────────────────────────
       const startedAt = activeCalls.get(callId)?.startedAt;
