@@ -86,30 +86,34 @@ class TokenTracker {
    * Check if a request can proceed given the rate limit config.
    * Returns { allowed: boolean, reason?: string, usage }
    */
-  canProceed(callId, extensionId, rateLimitConfig) {
+  canProceed(callId, extensionId, rateLimitConfig, estimatedNewTokens = 0) {
     if (!rateLimitConfig) return { allowed: true, reason: null, usage: null };
 
     const usage = this.getUsage(callId, extensionId);
     const { maxTokensPerCall, maxTokensPerMinute, maxTokensPerHour, warningThreshold } = rateLimitConfig;
 
+    const projectedCallTokens = usage.callTokens + estimatedNewTokens;
+    const projectedMinuteTokens = usage.minuteTokens + estimatedNewTokens;
+    const projectedHourTokens = usage.hourTokens + estimatedNewTokens;
+
     // Check per-call limit
-    if (maxTokensPerCall > 0 && usage.callTokens >= maxTokensPerCall) {
-      return { allowed: false, reason: `Per-call limit reached (${usage.callTokens}/${maxTokensPerCall})`, usage };
+    if (maxTokensPerCall > 0 && projectedCallTokens >= maxTokensPerCall) {
+      return { allowed: false, reason: `Per-call limit reached (${projectedCallTokens}/${maxTokensPerCall})`, usage };
     }
     // Check per-minute limit
-    if (maxTokensPerMinute > 0 && usage.minuteTokens >= maxTokensPerMinute) {
-      return { allowed: false, reason: `Per-minute limit reached (${usage.minuteTokens}/${maxTokensPerMinute})`, usage };
+    if (maxTokensPerMinute > 0 && projectedMinuteTokens >= maxTokensPerMinute) {
+      return { allowed: false, reason: `Per-minute limit reached (${projectedMinuteTokens}/${maxTokensPerMinute})`, usage };
     }
     // Check per-hour limit
-    if (maxTokensPerHour > 0 && usage.hourTokens >= maxTokensPerHour) {
-      return { allowed: false, reason: `Per-hour limit reached (${usage.hourTokens}/${maxTokensPerHour})`, usage };
+    if (maxTokensPerHour > 0 && projectedHourTokens >= maxTokensPerHour) {
+      return { allowed: false, reason: `Per-hour limit reached (${projectedHourTokens}/${maxTokensPerHour})`, usage };
     }
 
     // Log warning if approaching threshold
     if (warningThreshold > 0 && maxTokensPerCall > 0) {
-      const pct = (usage.callTokens / maxTokensPerCall) * 100;
+      const pct = (projectedCallTokens / maxTokensPerCall) * 100;
       if (pct >= warningThreshold) {
-        console.warn(`⚠️  Token usage at ${pct.toFixed(0)}% of per-call limit (${usage.callTokens}/${maxTokensPerCall})`);
+        console.warn(`⚠️  Token usage at ${pct.toFixed(0)}% of per-call limit (${projectedCallTokens}/${maxTokensPerCall})`);
       }
     }
 
@@ -472,9 +476,35 @@ async function respondToUser(
 
   console.log(`\n💬 User: ${transcript}`);
 
+  // Construct context strings to properly estimate tokens
+  const basePrompt = agentConfig?.systemPrompt?.trim()
+    ? agentConfig.systemPrompt
+    : `You are a helpful voice assistant on a phone call.
+Keep answers SHORT — 1 to 2 sentences. Be natural and conversational.`;
+
+  const ragSection = ragText
+    ? `\n\nKNOWLEDGE BASE — use this as your primary source of truth when answering:\n"""\n${ragText}\n"""\nOnly answer based on the above context. If the answer is not in the context, politely say you don't have that information.`
+    : "";
+
+  const systemContent = `${basePrompt}${ragSection}
+
+IMPORTANT: Always reply in the SAME language the user is speaking.
+- If user speaks Urdu → reply in Urdu (Urdu script)
+- If user speaks Arabic → reply in Arabic
+- If user speaks English → reply in English
+- If user mixes Urdu+English → reply in same mix
+- Sound like a polite call center agent. No lists or long explanations.`;
+
+  // Calculate actual total input tokens for this request (System Prompt + full history + new API payload)
+  // OpenAI is stateless and charges for the entire context window on every turn.
+  let inputTokenEstimate = estimateTokens(systemContent) + estimateTokens(transcript);
+  for (const msg of history) {
+    inputTokenEstimate += estimateTokens(msg.content);
+  }
+
   // ── Token rate limit check ────────────────────────────────────────────────
   if (rateLimitConfig && callId && extensionId) {
-    const check = tokenTracker.canProceed(callId, extensionId, rateLimitConfig);
+    const check = tokenTracker.canProceed(callId, extensionId, rateLimitConfig, inputTokenEstimate);
     if (!check.allowed) {
       console.log(`🚫 Token limit blocked: ${check.reason}`);
       // TTS a polite apology instead of calling GPT
@@ -482,8 +512,8 @@ async function respondToUser(
       onStart(sender);
       try {
         const apologyText = detectedLang === "ur"
-          ? "معذرت، اس کال کے لیے ٹوکن کی حد پوری ہو چکی ہے۔"
-          : "I'm sorry, the usage limit has been reached for this session.";
+          ? "معذرت خواہ ہیں، لیکن یہ کال اپنے مقررہ وقت کو پہنچ چکی ہے۔ مزید بات چیت کے لیے براہِ کرم بعد میں دوبارہ کال کریں۔ آپ کا شکریہ اور آپ کا دن اچھا گزرے۔"
+          : "We apologize, but this session has reached its maximum time limit. Please call back later to continue our conversation. Thank you and have a great day.";
         console.log(`🗣️  TTS (limit apology): "${apologyText}"`);
         const res = await openai.audio.speech.create({
           model: "tts-1", voice: "alloy", input: apologyText,
@@ -499,17 +529,12 @@ async function respondToUser(
       onDone();
       return;
     }
-  }
 
-  history.push({ role: "user", content: transcript });
-
-  // Estimate tokens for THIS turn only (new user message)
-  // Do NOT sum the full history — that double-counts every previous turn
-  const inputTokenEstimate = estimateTokens(transcript);
-  if (rateLimitConfig && callId && extensionId) {
     tokenTracker.addTokens(callId, extensionId, inputTokenEstimate);
     console.log(`📊 Input tokens ~${inputTokenEstimate} | Call total: ${tokenTracker.getUsage(callId, extensionId).callTokens}`);
   }
+
+  history.push({ role: "user", content: transcript });
 
   const sender = createRtpSender(rtpSock, remote.ip, remote.port);
   onStart(sender);
@@ -517,33 +542,6 @@ async function respondToUser(
   console.log(`📤 Will send audio → ${remote.ip}:${remote.port}`);
 
   try {
-    const langLabel =
-      detectedLang === "ur"
-        ? "Urdu"
-        : detectedLang === "ar"
-          ? "Arabic"
-          : "English";
-
-    // Use agent's custom systemPrompt if provided, otherwise fall back to default
-    const basePrompt = agentConfig?.systemPrompt?.trim()
-      ? agentConfig.systemPrompt
-      : `You are a helpful voice assistant on a phone call.
-Keep answers SHORT — 1 to 2 sentences. Be natural and conversational.`;
-
-    // Append multilanguage instruction (always enforced)
-    const ragSection = ragText
-      ? `\n\nKNOWLEDGE BASE — use this as your primary source of truth when answering:\n"""\n${ragText}\n"""\nOnly answer based on the above context. If the answer is not in the context, politely say you don't have that information.`
-      : "";
-
-    const systemContent = `${basePrompt}${ragSection}
-
-IMPORTANT: Always reply in the SAME language the user is speaking.
-- If user speaks Urdu → reply in Urdu (Urdu script)
-- If user speaks Arabic → reply in Arabic
-- If user speaks English → reply in English
-- If user mixes Urdu+English → reply in same mix
-- Sound like a polite call center agent. No lists or long explanations.`;
-
     const model = agentConfig?.modelName || "gpt-4o-mini";
 
     const stream = await openai.chat.completions.create({
