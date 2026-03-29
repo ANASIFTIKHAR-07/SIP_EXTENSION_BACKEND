@@ -15,6 +15,7 @@ import { CallLog } from "../models/calllog.model.js";
 import { SipExtension } from "../models/extension.model.js";
 import { AIAgent } from "../models/aiagent.model.js";
 import { RagContext } from "../models/ragcontext.model.js";
+import { RagChunk } from "../models/ragchunk.model.js";
 import { RateLimit } from "../models/ratelimit.model.js";
 
 export const srf = new Srf();
@@ -129,6 +130,42 @@ class TokenTracker {
 }
 
 const tokenTracker = new TokenTracker();
+
+// ── Vector RAG Helpers ───────────────────────────────────────────────────────
+function cosineSimilarity(a, b) {
+  let dot = 0, magA = 0, magB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    magA += a[i] * a[i];
+    magB += b[i] * b[i];
+  }
+  const denom = Math.sqrt(magA) * Math.sqrt(magB);
+  return denom === 0 ? 0 : dot / denom;
+}
+
+async function retrieveRelevantChunks(transcript, ragChunks, topK = 3) {
+  if (!ragChunks || ragChunks.length === 0) return [];
+
+  // Embed the user's transcript (~20ms API call)
+  const response = await openai.embeddings.create({
+    model: "text-embedding-3-small",
+    input: transcript,
+  });
+  const queryVector = response.data[0].embedding;
+
+  // Score every chunk via cosine similarity (~0.1ms, pure JS math)
+  const scored = ragChunks.map(chunk => ({
+    text: chunk.text,
+    score: cosineSimilarity(queryVector, chunk.embedding),
+  }));
+
+  // Return top K chunks sorted by relevance
+  scored.sort((a, b) => b.score - a.score);
+  const topChunks = scored.slice(0, topK);
+
+  console.log(`🔍 Retrieved ${topChunks.length} chunks (scores: ${topChunks.map(c => c.score.toFixed(3)).join(", ")})`);
+  return topChunks.map(c => c.text);
+}
 
 
 function parseRemoteRtp(sdp) {
@@ -450,7 +487,7 @@ function createDeepgramWS(onUtterance) {
 //   console.log("\n🎙️  Listening...");
 // }
 
-// Updated Version — with token rate limiting
+// Updated Version — with token rate limiting + vector RAG retrieval
 async function respondToUser(
   transcript,
   detectedLang,
@@ -462,7 +499,7 @@ async function respondToUser(
   isInterrupted,
   isBotEnabled,
   agentConfig,        // { systemPrompt, modelName } from AIAgent doc (optional)
-  ragText,            // extracted text from active RagContext (optional)
+  ragChunks,          // array of { text, embedding } loaded into RAM at call start
   rateLimitConfig,    // { maxTokensPerCall, maxTokensPerMinute, maxTokensPerHour, warningThreshold } (optional)
   callId,             // for per-call token tracking
   extensionId,        // for per-extension rate limiting
@@ -476,15 +513,22 @@ async function respondToUser(
 
   console.log(`\n💬 User: ${transcript}`);
 
+  // ── Vector RAG Retrieval ─────────────────────────────────────────────────
+  let ragSection = "";
+  try {
+    const relevantChunks = await retrieveRelevantChunks(transcript, ragChunks, 3);
+    if (relevantChunks.length > 0) {
+      ragSection = `\n\nRELEVANT CONTEXT — use this as your primary source of truth when answering:\n"""\n${relevantChunks.join("\n\n")}\n"""\nOnly answer based on the above context. If the answer is not in the context, politely say you don't have that information.`;
+    }
+  } catch (e) {
+    console.error("⚠️ RAG retrieval failed, continuing without context:", e.message);
+  }
+
   // Construct context strings to properly estimate tokens
   const basePrompt = agentConfig?.systemPrompt?.trim()
     ? agentConfig.systemPrompt
     : `You are a helpful voice assistant on a phone call.
 Keep answers SHORT — 1 to 2 sentences. Be natural and conversational.`;
-
-  const ragSection = ragText
-    ? `\n\nKNOWLEDGE BASE — use this as your primary source of truth when answering:\n"""\n${ragText}\n"""\nOnly answer based on the above context. If the answer is not in the context, politely say you don't have that information.`
-    : "";
 
   const systemContent = `${basePrompt}${ragSection}
 
@@ -628,7 +672,7 @@ IMPORTANT: Always reply in the SAME language the user is speaking.
 }
 
 // ── Call Handler ──────────────────────────────────────────────────────────────
-async function handleCall(localRtpPort, remote, callMeta, agentConfig, ragText, rateLimitConfig, extensionId) {
+async function handleCall(localRtpPort, remote, callMeta, agentConfig, ragChunks, rateLimitConfig, extensionId) {
   const history = [];
   let currentSender = null;
   let botSpeaking = false;
@@ -686,7 +730,7 @@ async function handleCall(localRtpPort, remote, callMeta, agentConfig, ragText, 
       () => interrupted,
       isBotEnabled,
       agentConfig,
-      ragText,
+      ragChunks,
       rateLimitConfig,
       callMeta.callId,
       extensionId,
@@ -813,11 +857,19 @@ srf.invite(async (req, res) => {
     }
 
     // Fetch active RAG context — scoped to this extension's owner to prevent cross-user leakage
+    // Load chunks + embeddings into RAM for the lifetime of this call session
     const ownerId = extDoc?.createdBy ?? null;
-    const ragDoc = await RagContext.findOne({ isActive: true, uploadedBy: ownerId }).select("extractedText fileName");
-    const ragText = ragDoc?.extractedText || null;
-    if (ragText) console.log(`📄 RAG context loaded: "${ragDoc.fileName}" (${ragText.length} chars)`);
-    if (!ragText && ownerId) console.log("📄 No active RAG context for this extension's owner");
+    const ragDoc = await RagContext.findOne({ isActive: true, uploadedBy: ownerId }).select("_id fileName");
+    let ragChunks = [];
+    if (ragDoc) {
+      ragChunks = await RagChunk.find({ ragContextId: ragDoc._id })
+        .select("text embedding")
+        .sort({ chunkIndex: 1 })
+        .lean();
+      console.log(`📄 RAG context loaded: "${ragDoc.fileName}" → ${ragChunks.length} chunks in RAM`);
+    } else if (ownerId) {
+      console.log("📄 No active RAG context for this extension's owner");
+    }
 
     // Fetch token rate limit config for this extension
     // If no DB row exists, apply schema defaults so limits are always enforced
@@ -845,7 +897,7 @@ srf.invite(async (req, res) => {
       }
     }
 
-    const session = await handleCall(port, remote, callMeta, agentConfig, ragText, rateLimitConfig, extensionId?.toString());
+    const session = await handleCall(port, remote, callMeta, agentConfig, ragChunks, rateLimitConfig, extensionId?.toString());
 
     // ── Log to DB + in-memory ──────────────────────────────────────────────
     await CallLog.create({
