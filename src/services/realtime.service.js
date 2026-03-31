@@ -504,6 +504,7 @@ async function respondToUser(
   callId,             // for per-call token tracking
   extensionId,        // for per-extension rate limiting
   onSpeak,            // callback fired exactly when audio starts playing
+  abortSignal,        // AbortSignal to cancel OpenAI requests on interrupt
 ) {
   // Respect bot-enabled flag set via API
   if (!isBotEnabled()) {
@@ -597,14 +598,14 @@ IMPORTANT: Always reply in the SAME language the user is speaking.
         { role: "system", content: systemContent },
         ...history,
       ],
-    });
+    }, { signal: abortSignal });
 
     let fullReply = "";
     let pending = "";
 
     async function flushTTS(text) {
       text = text.trim();
-      if (!text || isInterrupted() || !isBotEnabled()) return;
+      if (!text || isInterrupted() || !isBotEnabled() || abortSignal?.aborted) return;
       console.log(`🗣️  TTS: "${text}"`);
       try {
         const res = await openai.audio.speech.create({
@@ -613,19 +614,19 @@ IMPORTANT: Always reply in the SAME language the user is speaking.
           input: text,
           response_format: "pcm",
           speed: 1.0,
-        });
-        if (isInterrupted() || !isBotEnabled()) return;
+        }, { signal: abortSignal });
+        if (isInterrupted() || !isBotEnabled() || abortSignal?.aborted) return;
         const pcm = Buffer.from(await res.arrayBuffer());
         const mulaw = pcm24kToMulaw8k(pcm);
         console.log(
           `🔊 Streaming ${mulaw.length} bytes (${Math.ceil(mulaw.length / 160)} packets) → ${remote.ip}:${remote.port}`,
         );
-        if (!isInterrupted() && isBotEnabled()) {
+        if (!isInterrupted() && isBotEnabled() && !abortSignal?.aborted) {
           if (onSpeak) onSpeak();
           await sender.streamBuffer(mulaw);
         }
       } catch (e) {
-        console.error("❌ TTS error:", e.message);
+        if (e.name !== 'AbortError') console.error("❌ TTS error:", e.message);
       }
     }
 
@@ -658,12 +659,12 @@ IMPORTANT: Always reply in the SAME language the user is speaking.
     if (!isInterrupted() && isBotEnabled() && pending.trim())
       await flushTTS(pending);
 
-    if (!isInterrupted()) {
+    if (!isInterrupted() && !abortSignal?.aborted) {
       history.push({ role: "assistant", content: fullReply });
       console.log(`\n🤖 Bot: ${fullReply}`);
     }
   } catch (e) {
-    console.error("❌ GPT error:", e.message);
+    if (e.name !== 'AbortError') console.error("❌ GPT error:", e.message);
   }
 
   sender.stop();
@@ -678,14 +679,19 @@ async function handleCall(localRtpPort, remote, callMeta, agentConfig, ragChunks
   let botSpeaking = false;
   let interrupted = false;
   let processing = false;
+  let currentAbortController = null;
 
   function interrupt() {
     if (botSpeaking && currentSender) {
-      console.log("\n⚡ Interrupted!");
+      console.log("\n⚡ Interrupted! Aborting active streams...");
       interrupted = true;
       currentSender.stop();
       currentSender = null;
       botSpeaking = false;
+      // Immediately abort any in-flight OpenAI requests (GPT stream + TTS)
+      if (currentAbortController) {
+        currentAbortController.abort();
+      }
     }
   }
 
@@ -705,10 +711,25 @@ async function handleCall(localRtpPort, remote, callMeta, agentConfig, ragChunks
     const isBotEnabled = () => callEntry?.botEnabled ?? true;
 
     if (botSpeaking) interrupt();
-    if (processing) return;
+
+    // If the previous response is still winding down after interrupt,
+    // wait for it to finish (should be fast since we aborted its streams)
+    if (processing) {
+      console.log("⏳ Waiting for previous response to finish after interrupt...");
+      const waitStart = Date.now();
+      while (processing && Date.now() - waitStart < 2000) {
+        await new Promise(r => setTimeout(r, 30));
+      }
+      if (processing) {
+        // Safety: force-clear if it didn't complete in 2 seconds
+        console.warn("⚠️ Force-clearing processing lock after timeout");
+        processing = false;
+      }
+    }
 
     processing = true;
     interrupted = false;
+    currentAbortController = new AbortController();
 
     await respondToUser(
       transcript,
@@ -737,7 +758,8 @@ async function handleCall(localRtpPort, remote, callMeta, agentConfig, ragChunks
       () => {
         // Fired instantly before the first RTP bits are sent across the wire
         botSpeaking = true;
-      }
+      },
+      currentAbortController.signal,
     );
     // Note: processing is reset to false inside onDone() callback above
   });
