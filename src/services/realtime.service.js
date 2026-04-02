@@ -24,6 +24,15 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const DEEPGRAM_KEY = process.env.DEEPGRAM_API_KEY;
 const PUBLIC_IP = process.env.PUBLIC_IP;
 
+const SIP_DRACHTIO_HOST = process.env.SIP_DRACHTIO_HOST || "127.0.0.1";
+const SIP_DRACHTIO_PORT = parseInt(process.env.SIP_DRACHTIO_PORT) || 9022;
+const SIP_DRACHTIO_SECRET = process.env.SIP_DRACHTIO_SECRET || "cymru";
+const SIP_REGISTER_URI = process.env.SIP_REGISTER_URI;
+const SIP_DOMAIN = process.env.SIP_DOMAIN;
+const SIP_EXTENSION = process.env.SIP_EXTENSION;
+const SIP_PORT = process.env.SIP_PORT || "5070";
+const SIP_PASSWORD = process.env.SIP_PASSWORD;
+
 if (!DEEPGRAM_KEY) {
   console.error("❌ Set DEEPGRAM_API_KEY");
   process.exit(1);
@@ -815,7 +824,7 @@ async function handleCall(localRtpPort, remote, callMeta, agentConfig, ragChunks
 }
 
 // ── SIP ───────────────────────────────────────────────────────────────────────
-srf.connect({ host: "127.0.0.1", port: 9022, secret: "cymru" });
+srf.connect({ host: SIP_DRACHTIO_HOST, port: SIP_DRACHTIO_PORT, secret: SIP_DRACHTIO_SECRET });
 
 srf.on("connect", (err) => {
   if (err) {
@@ -825,15 +834,15 @@ srf.on("connect", (err) => {
   console.log("✅ drachtio connected. Registering...");
 
   srf.request(
-    "sip:q.sgycm.yeastarcloud.com",
+    SIP_REGISTER_URI,
     {
       method: "REGISTER",
       headers: {
-        Contact: `<sip:208@${PUBLIC_IP}:5070>`,
-        To: "sip:208@q.sgycm.yeastarcloud.com",
-        From: "sip:208@q.sgycm.yeastarcloud.com",
+        Contact: `<sip:${SIP_EXTENSION}@${PUBLIC_IP}:${SIP_PORT}>`,
+        To: `sip:${SIP_EXTENSION}@${SIP_DOMAIN}`,
+        From: `sip:${SIP_EXTENSION}@${SIP_DOMAIN}`,
       },
-      auth: { username: "208", password: "Smart@0500" },
+      auth: { username: SIP_EXTENSION, password: SIP_PASSWORD },
     },
     (err, req) => {
       if (err) return console.log("❌ Register failed:", err);
