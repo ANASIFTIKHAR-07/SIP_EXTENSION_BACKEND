@@ -682,7 +682,7 @@ IMPORTANT: Always reply in the SAME language the user is speaking.
 }
 
 // ── Call Handler ──────────────────────────────────────────────────────────────
-async function handleCall(localRtpPort, remote, callMeta, agentConfig, ragChunks, rateLimitConfig, extensionId) {
+async function handleCall(localRtpPort, remote, callMeta, agentConfig, ragChunks, rateLimitConfig, extensionId, preBoundRtpSock) {
   const history = [];
   let currentSender = null;
   let botSpeaking = false;
@@ -704,7 +704,8 @@ async function handleCall(localRtpPort, remote, callMeta, agentConfig, ragChunks
     }
   }
 
-  const rtpSock = dgram.createSocket("udp4");
+  // Use pre-bound socket from invite handler (socket is already listening for RTP)
+  const rtpSock = preBoundRtpSock;
   let actualRemote = { ...remote };
   let firstPacket = true;
   let highEnergyCount = 0;
@@ -808,10 +809,6 @@ async function handleCall(localRtpPort, remote, callMeta, agentConfig, ragChunks
 
   rtpSock.on("error", (e) => console.error("❌ RTP error:", e.message));
 
-  rtpSock.bind(localRtpPort, "0.0.0.0", () => {
-    console.log(`🎧 RTP socket bound on 0.0.0.0:${localRtpPort}`);
-  });
-
   return {
     stop: () => {
       dg.close();
@@ -867,8 +864,17 @@ srf.invite(async (req, res) => {
   console.log(`\n📞 Call: ${fromNum} → ${toNum}  [${callId}]`);
   console.log(`📡 Remote RTP from SDP: ${remote.ip}:${remote.port}`);
 
-  // ── Answer the call IMMEDIATELY to prevent PBX timeout ─────────────────
+  // ── 1. Bind RTP socket FIRST so it's ready to receive audio ────────────
   const port = getFreePort();
+  const rtpSock = dgram.createSocket("udp4");
+  await new Promise((resolve) => {
+    rtpSock.bind(port, "0.0.0.0", () => {
+      console.log(`🎧 RTP socket bound on 0.0.0.0:${port}`);
+      resolve();
+    });
+  });
+
+  // ── 2. Answer the call (socket is already listening) ───────────────────
   res.send(100);
   res.send(180);  // Ringing — keeps PBX alive during setup
 
@@ -879,6 +885,7 @@ srf.invite(async (req, res) => {
     });
   } catch (e) {
     console.error("❌ Failed to answer call:", e.message);
+    try { rtpSock.close(); } catch (_) { }
     usedPorts.delete(port);
     return;
   }
@@ -945,7 +952,7 @@ srf.invite(async (req, res) => {
       }
     }
 
-    const session = await handleCall(port, remote, callMeta, agentConfig, ragChunks, rateLimitConfig, extensionId?.toString());
+    const session = await handleCall(port, remote, callMeta, agentConfig, ragChunks, rateLimitConfig, extensionId?.toString(), rtpSock);
 
     // ── Log to DB + in-memory ──────────────────────────────────────────────
     await CallLog.create({
