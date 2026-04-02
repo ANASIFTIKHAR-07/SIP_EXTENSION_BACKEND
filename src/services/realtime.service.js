@@ -834,7 +834,7 @@ srf.on("connect", (err) => {
   console.log("✅ drachtio connected. Registering...");
 
   srf.request(
-    SIP_REGISTER_URI,
+    SIP_REGISTER_URI.startsWith("sip:") ? SIP_REGISTER_URI : `sip:${SIP_REGISTER_URI}`,
     {
       method: "REGISTER",
       headers: {
@@ -866,10 +866,27 @@ srf.invite(async (req, res) => {
 
   console.log(`\n📞 Call: ${fromNum} → ${toNum}  [${callId}]`);
   console.log(`📡 Remote RTP from SDP: ${remote.ip}:${remote.port}`);
-  res.send(100);
 
+  // ── Answer the call IMMEDIATELY to prevent PBX timeout ─────────────────
+  const port = getFreePort();
+  res.send(100);
+  res.send(180);  // Ringing — keeps PBX alive during setup
+
+  let dialog;
   try {
-    const port = getFreePort();
+    dialog = await srf.createUAS(req, res, {
+      localSdp: buildAnswerSdp(port),
+    });
+  } catch (e) {
+    console.error("❌ Failed to answer call:", e.message);
+    usedPorts.delete(port);
+    return;
+  }
+
+  console.log("✅ Call answered — setting up media pipeline...");
+
+  // ── Now do the heavy async work (call is already established) ──────────
+  try {
     const callMeta = {
       callId,
       fromNumber: fromNum,
@@ -952,11 +969,7 @@ srf.invite(async (req, res) => {
       currentSender: null,
     });
 
-    const dialog = await srf.createUAS(req, res, {
-      localSdp: buildAnswerSdp(port),
-    });
-
-    console.log("✅ Call LIVE!\n");
+    console.log("✅ Media pipeline ready!\n");
 
     dialog.on("destroy", async () => {
       console.log("📵 Call ended");
@@ -986,16 +999,15 @@ srf.invite(async (req, res) => {
       );
     });
   } catch (e) {
-    console.error("❌ Call error:", e.message, e.stack);
+    console.error("❌ Call setup error:", e.message, e.stack);
+    // Call is live but media pipeline failed — hang up gracefully
+    try { dialog.destroy(); } catch (_) { }
+    usedPorts.delete(port);
 
     await CallLog.findOneAndUpdate({ callId }, { status: "failed" }).catch(
       () => { },
     );
     activeCalls.delete(callId);
-
-    try {
-      res.send(500);
-    } catch (_) { }
   }
 });
 
