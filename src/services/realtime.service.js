@@ -874,7 +874,7 @@ srf.invite(async (req, res) => {
       callId,
       fromNumber: fromNum,
       toNumber: toNum,
-      extension: "208",
+      extension: toNum,
     };
 
     // Look up the extension's assigned AI agent
@@ -933,7 +933,7 @@ srf.invite(async (req, res) => {
     // ── Log to DB + in-memory ──────────────────────────────────────────────
     await CallLog.create({
       callId,
-      extension: "208",
+      extension: toNum,
       fromNumber: fromNum,
       toNumber: toNum,
       remoteIp: remote.ip,
@@ -946,7 +946,7 @@ srf.invite(async (req, res) => {
       session,
       fromNumber: fromNum,
       toNumber: toNum,
-      extension: "208",
+      extension: toNum,
       startedAt: new Date(),
       botEnabled: true,
       currentSender: null,
