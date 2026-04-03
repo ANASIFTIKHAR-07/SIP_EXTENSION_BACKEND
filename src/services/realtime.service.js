@@ -17,6 +17,7 @@ import { AIAgent } from "../models/aiagent.model.js";
 import { RagContext } from "../models/ragcontext.model.js";
 import { RagChunk } from "../models/ragchunk.model.js";
 import { RateLimit } from "../models/ratelimit.model.js";
+import { CctvProduct } from "../models/cctvproduct.model.js";
 
 export const srf = new Srf();
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -512,6 +513,7 @@ async function respondToUser(
   rateLimitConfig,    // { maxTokensPerCall, maxTokensPerMinute, maxTokensPerHour, warningThreshold } (optional)
   callId,             // for per-call token tracking
   extensionId,        // for per-extension rate limiting
+  cctvProducts,       // array of CCTV products for sales agent
   onSpeak,            // callback fired exactly when audio starts playing
   abortSignal,        // AbortSignal to cancel OpenAI requests on interrupt
 ) {
@@ -540,7 +542,25 @@ async function respondToUser(
     : `You are a helpful voice assistant on a phone call.
 Keep answers SHORT — 1 to 2 sentences. Be natural and conversational.`;
 
-  const systemContent = `${basePrompt}${ragSection}
+  let cctvSection = "";
+  let salesCloserSection = "";
+  
+  if (cctvProducts && cctvProducts.length > 0) {
+    const productList = cctvProducts.map(p => 
+      `- ${p.brand} ${p.model} (${p.category}, ${p.resolution}): PKR ${p.priceMin} - ${p.priceMax}. Features: ${p.features.join(", ")}. ${p.description}`
+    ).join("\n");
+    
+    cctvSection = `\n\nCCTV PRODUCT CATALOG:\n"""\n${productList}\n"""`;
+    
+    salesCloserSection = `\n\nSALES CLOSER INSTRUCTIONS:
+- You are representing a CCTV provider. Act as a persuasive, polite sales closer.
+- NEVER bluntly refuse a user's request. If you don't know something, say "Let me double-check that with our installation team for you" or similar.
+- Recommend products from the catalog above based on their needs.
+- Push gently for a sale or site survey.
+- Handle objections gracefully. Keep the conversation moving forward.`;
+  }
+
+  const systemContent = `${basePrompt}${salesCloserSection}${ragSection}${cctvSection}
 
 IMPORTANT: Always reply in the SAME language the user is speaking.
 - If user speaks Urdu → reply in Urdu (Urdu script)
@@ -682,7 +702,7 @@ IMPORTANT: Always reply in the SAME language the user is speaking.
 }
 
 // ── Call Handler ──────────────────────────────────────────────────────────────
-async function handleCall(localRtpPort, remote, callMeta, agentConfig, ragChunks, rateLimitConfig, extensionId) {
+async function handleCall(localRtpPort, remote, callMeta, agentConfig, ragChunks, rateLimitConfig, extensionId, cctvProducts, preBoundRtpSock) {
   const history = [];
   let currentSender = null;
   let botSpeaking = false;
@@ -704,7 +724,7 @@ async function handleCall(localRtpPort, remote, callMeta, agentConfig, ragChunks
     }
   }
 
-  const rtpSock = dgram.createSocket("udp4");
+  const rtpSock = preBoundRtpSock;
   let actualRemote = { ...remote };
   let firstPacket = true;
   let highEnergyCount = 0;
@@ -764,6 +784,7 @@ async function handleCall(localRtpPort, remote, callMeta, agentConfig, ragChunks
       rateLimitConfig,
       callMeta.callId,
       extensionId,
+      cctvProducts,
       () => {
         // Fired instantly before the first RTP bits are sent across the wire
         botSpeaking = true;
@@ -808,17 +829,10 @@ async function handleCall(localRtpPort, remote, callMeta, agentConfig, ragChunks
 
   rtpSock.on("error", (e) => console.error("❌ RTP error:", e.message));
 
-  rtpSock.bind(localRtpPort, "0.0.0.0", () => {
-    console.log(`🎧 RTP socket bound on 0.0.0.0:${localRtpPort}`);
-  });
-
   return {
     stop: () => {
       dg.close();
-      try {
-        rtpSock.close();
-      } catch (_) { }
-      if (currentSender) currentSender.stop();
+      // Note: rtpSock is managed by the caller in this refactor
     },
   };
 }
@@ -867,8 +881,17 @@ srf.invite(async (req, res) => {
   console.log(`\n📞 Call: ${fromNum} → ${toNum}  [${callId}]`);
   console.log(`📡 Remote RTP from SDP: ${remote.ip}:${remote.port}`);
 
-  // ── Answer the call IMMEDIATELY to prevent PBX timeout ─────────────────
+  // ── 1. Bind RTP socket FIRST so it's ready to receive audio ────────────
   const port = getFreePort();
+  const rtpSock = dgram.createSocket("udp4");
+  await new Promise((resolve) => {
+    rtpSock.bind(port, "0.0.0.0", () => {
+      console.log(`🎧 RTP socket bound on 0.0.0.0:${port}`);
+      resolve();
+    });
+  });
+
+  // ── 2. Answer the call (socket is already listening) ───────────────────
   res.send(100);
   res.send(180);  // Ringing — keeps PBX alive during setup
 
@@ -879,6 +902,7 @@ srf.invite(async (req, res) => {
     });
   } catch (e) {
     console.error("❌ Failed to answer call:", e.message);
+    try { rtpSock.close(); } catch (_) { }
     usedPorts.delete(port);
     return;
   }
@@ -945,7 +969,19 @@ srf.invite(async (req, res) => {
       }
     }
 
-    const session = await handleCall(port, remote, callMeta, agentConfig, ragChunks, rateLimitConfig, extensionId?.toString());
+    // Fetch CCTV Products for this extension's owner
+    let cctvProducts = [];
+    if (ownerId) {
+      cctvProducts = await CctvProduct.find({ createdBy: ownerId, isActive: true })
+        .sort({ brand: 1, category: 1, priceMin: 1 })
+        .lean();
+      if (cctvProducts.length > 0) {
+        console.log(`📦 CCTV catalog loaded: ${cctvProducts.length} products ready for sales agent.`);
+      }
+    }
+
+
+    const session = await handleCall(port, remote, callMeta, agentConfig, ragChunks, rateLimitConfig, extensionId?.toString(), cctvProducts, rtpSock);
 
     // ── Log to DB + in-memory ──────────────────────────────────────────────
     await CallLog.create({
