@@ -28,7 +28,7 @@ import callRoutes from "./routes/call.routes.js";
 import aiAgentRoutes from "./routes/aiagent.routes.js";
 import rateLimitRoutes from "./routes/ratelimit.routes.js";
 import ragContextRoutes from "./routes/ragcontext.routes.js";
-import cctvProductRoutes from "./routes/cctvproduct.routes.js";
+import dynamicDataRoutes from "./routes/dynamicdata.routes.js";
 
 app.use("/api/v1/users", userRoutes);
 app.use("/api/v1/sip", extensionRoutes);
@@ -36,7 +36,7 @@ app.use("/api/v1/calls", callRoutes);
 app.use("/api/v1/ai-agents", aiAgentRoutes);
 app.use("/api/v1/rate-limits", rateLimitRoutes);
 app.use("/api/v1/rag", ragContextRoutes);
-app.use("/api/v1/cctv-products", cctvProductRoutes);
+app.use("/api/v1/dynamic-data", dynamicDataRoutes);
 
 app.use((req, res) => {
   res.status(404).json({

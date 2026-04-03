@@ -17,7 +17,7 @@ import { AIAgent } from "../models/aiagent.model.js";
 import { RagContext } from "../models/ragcontext.model.js";
 import { RagChunk } from "../models/ragchunk.model.js";
 import { RateLimit } from "../models/ratelimit.model.js";
-import { CctvProduct } from "../models/cctvproduct.model.js";
+import { DynamicData } from "../models/dynamicdata.model.js";
 
 export const srf = new Srf();
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -513,7 +513,7 @@ async function respondToUser(
   rateLimitConfig,    // { maxTokensPerCall, maxTokensPerMinute, maxTokensPerHour, warningThreshold } (optional)
   callId,             // for per-call token tracking
   extensionId,        // for per-extension rate limiting
-  cctvProducts,       // array of CCTV products for sales agent
+  dynamicDataContent, // string of dynamic data context
   onSpeak,            // callback fired exactly when audio starts playing
   abortSignal,        // AbortSignal to cancel OpenAI requests on interrupt
 ) {
@@ -542,25 +542,23 @@ async function respondToUser(
     : `You are a helpful voice assistant on a phone call.
 Keep answers SHORT — 1 to 2 sentences. Be natural and conversational.`;
 
-  let cctvSection = "";
+  let dynamicSection = "";
   let salesCloserSection = "";
   
-  if (cctvProducts && cctvProducts.length > 0) {
-    const productList = cctvProducts.map(p => 
-      `- ${p.brand} ${p.model} (${p.category}, ${p.resolution}): PKR ${p.priceMin} - ${p.priceMax}. Features: ${p.features.join(", ")}. ${p.description}`
-    ).join("\n");
+  // Dynamic tabular data injected directly
+  if (dynamicDataContent) {
+    dynamicSection = `\n\nLIVE DYNAMIC DATA / RATES / INVENTORY:\n"""\n${dynamicDataContent}\n"""`;
     
-    cctvSection = `\n\nCCTV PRODUCT CATALOG:\n"""\n${productList}\n"""`;
-    
-    salesCloserSection = `\n\nSALES CLOSER INSTRUCTIONS:
-- You are representing a CCTV provider. Act as a persuasive, polite sales closer.
-- NEVER bluntly refuse a user's request. If you don't know something, say "Let me double-check that with our installation team for you" or similar.
-- Recommend products from the catalog above based on their needs.
-- Push gently for a sale or site survey.
+    // We keep the generalized sales behavior here, as approved by the user
+    salesCloserSection = `\n\nSALES & CONSULTING INSTRUCTIONS:
+- You represent a business. Act as a persuasive, polite consultant or sales closer.
+- NEVER bluntly refuse a user's request. If you don't know something, say "Let me double-check that with my team" or similar.
+- Recommend options from the dynamic data above based on their needs.
+- Push gently for a sale, meeting, or next step.
 - Handle objections gracefully. Keep the conversation moving forward.`;
   }
 
-  const systemContent = `${basePrompt}${salesCloserSection}${ragSection}${cctvSection}
+  const systemContent = `${basePrompt}${salesCloserSection}${ragSection}${dynamicSection}
 
 IMPORTANT: Always reply in the SAME language the user is speaking.
 - If user speaks Urdu → reply in Urdu (Urdu script)
@@ -702,7 +700,7 @@ IMPORTANT: Always reply in the SAME language the user is speaking.
 }
 
 // ── Call Handler ──────────────────────────────────────────────────────────────
-async function handleCall(localRtpPort, remote, callMeta, agentConfig, ragChunks, rateLimitConfig, extensionId, cctvProducts, preBoundRtpSock) {
+async function handleCall(localRtpPort, remote, callMeta, agentConfig, ragChunks, rateLimitConfig, extensionId, dynamicDataContent, preBoundRtpSock) {
   const history = [];
   let currentSender = null;
   let botSpeaking = false;
@@ -784,7 +782,7 @@ async function handleCall(localRtpPort, remote, callMeta, agentConfig, ragChunks
       rateLimitConfig,
       callMeta.callId,
       extensionId,
-      cctvProducts,
+      dynamicDataContent,
       () => {
         // Fired instantly before the first RTP bits are sent across the wire
         botSpeaking = true;
@@ -969,19 +967,17 @@ srf.invite(async (req, res) => {
       }
     }
 
-    // Fetch CCTV Products for this extension's owner
-    let cctvProducts = [];
+    // Fetch synced dynamic sheets for this extension's owner
+    let dynamicDataContent = "";
     if (ownerId) {
-      cctvProducts = await CctvProduct.find({ createdBy: ownerId, isActive: true })
-        .sort({ brand: 1, category: 1, priceMin: 1 })
-        .lean();
-      if (cctvProducts.length > 0) {
-        console.log(`📦 CCTV catalog loaded: ${cctvProducts.length} products ready for sales agent.`);
+      const sheets = await DynamicData.find({ createdBy: ownerId }).sort({ updatedAt: -1 }).lean();
+      if (sheets.length > 0) {
+        dynamicDataContent = sheets.map(s => `--- DATA SOURCE: ${s.name} ---\n${s.content}`).join("\n\n");
+        console.log(`📊 Dynamic Data loaded: ${sheets.length} datasets ready.`);
       }
     }
 
-
-    const session = await handleCall(port, remote, callMeta, agentConfig, ragChunks, rateLimitConfig, extensionId?.toString(), cctvProducts, rtpSock);
+    const session = await handleCall(port, remote, callMeta, agentConfig, ragChunks, rateLimitConfig, extensionId?.toString(), dynamicDataContent, rtpSock);
 
     // ── Log to DB + in-memory ──────────────────────────────────────────────
     await CallLog.create({
