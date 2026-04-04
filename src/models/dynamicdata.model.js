@@ -7,9 +7,18 @@ const dynamicDataSchema = new mongoose.Schema(
       required: true,
       trim: true,
     },
+    sourceType: {
+      type: String,
+      enum: ['google_sheet', 'file'],
+      default: 'google_sheet'
+    },
     googleSheetUrl: {
       type: String,
-      required: true,
+      required: function() { return this.sourceType === 'google_sheet'; }
+    },
+    fileName: {
+      type: String,
+      required: function() { return this.sourceType === 'file'; }
     },
     content: {
       type: String,
