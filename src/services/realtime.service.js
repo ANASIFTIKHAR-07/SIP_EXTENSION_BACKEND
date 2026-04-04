@@ -18,6 +18,7 @@ import { RagContext } from "../models/ragcontext.model.js";
 import { RagChunk } from "../models/ragchunk.model.js";
 import { RateLimit } from "../models/ratelimit.model.js";
 import { DynamicData } from "../models/dynamicdata.model.js";
+import { getLiveExtensions } from "./yeastar.service.js";
 
 export const srf = new Srf();
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -514,6 +515,8 @@ async function respondToUser(
   callId,             // for per-call token tracking
   extensionId,        // for per-extension rate limiting
   dynamicDataContent, // string of dynamic data context
+  pbxExtensionsStr,   // string of available extensions from yeastar
+  transferCallback,   // function to trigger a call transfer
   onSpeak,            // callback fired exactly when audio starts playing
   abortSignal,        // AbortSignal to cancel OpenAI requests on interrupt
 ) {
@@ -558,7 +561,17 @@ Keep answers SHORT — 1 to 2 sentences. Be natural and conversational.`;
 - Handle objections gracefully. Keep the conversation moving forward.`;
   }
 
-  const systemContent = `${basePrompt}${salesCloserSection}${ragSection}${dynamicSection}
+  let pbxSection = "";
+  if (pbxExtensionsStr && transferCallback) {
+    pbxSection = `\n\nCALL ROUTING / TRANSFER INSTRUCTIONS:
+- You have the ability to transfer this call to another human/department extension.
+- DO NOT blindly mention extensions unless asked, but if a user needs specialized help, offer to transfer them.
+- If you decide to transfer the call, use the \`transfer_call\` tool. DO NOT say "I will use the tool" out loud to the user.
+- LIVE AVAILABLE EXTENSIONS:
+${pbxExtensionsStr}`;
+  }
+
+  const systemContent = `${basePrompt}${salesCloserSection}${ragSection}${dynamicSection}${pbxSection}
 
 IMPORTANT: Always reply in the SAME language the user is speaking.
 - If user speaks Urdu → reply in Urdu (Urdu script)
@@ -616,7 +629,7 @@ IMPORTANT: Always reply in the SAME language the user is speaking.
   try {
     const model = agentConfig?.modelName || "gpt-4o-mini";
 
-    const stream = await openai.chat.completions.create({
+    const apiParams = {
       model,
       stream: true,
       max_tokens: 120,
@@ -625,10 +638,35 @@ IMPORTANT: Always reply in the SAME language the user is speaking.
         { role: "system", content: systemContent },
         ...history,
       ],
-    }, { signal: abortSignal });
+    };
+
+    if (transferCallback && pbxExtensionsStr) {
+      apiParams.tools = [
+        {
+          type: "function",
+          function: {
+            name: "transfer_call",
+            description: "Transfer the live phone call to a specific human department or extension.",
+            parameters: {
+              type: "object",
+              properties: {
+                target_extension: {
+                  type: "string",
+                  description: "The numerical extension to transfer the call to (e.g. '102'). Must be one of the available extensions."
+                }
+              },
+              required: ["target_extension"]
+            }
+          }
+        }
+      ];
+    }
+
+    const stream = await openai.chat.completions.create(apiParams, { signal: abortSignal });
 
     let fullReply = "";
     let pending = "";
+    let toolCallsAcc = null;
 
     async function flushTTS(text) {
       text = text.trim();
@@ -658,10 +696,29 @@ IMPORTANT: Always reply in the SAME language the user is speaking.
     }
 
     let outputTokenCount = 0;
+    let didTransfer = false;
 
     for await (const chunk of stream) {
       if (isInterrupted() || !isBotEnabled()) break;
-      const token = chunk.choices[0]?.delta?.content || "";
+      const delta = chunk.choices[0]?.delta;
+      if (!delta) break;
+
+      // Handle Tool Calls (e.g. transfer_call)
+      if (delta.tool_calls) {
+        if (!toolCallsAcc) toolCallsAcc = [];
+        for (const tc of delta.tool_calls) {
+          if (!toolCallsAcc[tc.index]) {
+            toolCallsAcc[tc.index] = { id: tc.id, name: tc.function.name, arguments: "" };
+          }
+          if (tc.function?.arguments) {
+            toolCallsAcc[tc.index].arguments += tc.function.arguments;
+          }
+        }
+        continue;
+      }
+
+      // Handle Standard Content
+      const token = delta.content || "";
       fullReply += token;
       pending += token;
       outputTokenCount += estimateTokens(token);
@@ -675,6 +732,31 @@ IMPORTANT: Always reply in the SAME language the user is speaking.
         pending = parts[parts.length - 1] || "";
       }
     }
+
+    // Process tools after stream finishes
+    if (!isInterrupted() && isBotEnabled() && toolCallsAcc && toolCallsAcc.length > 0) {
+      for (const tc of toolCallsAcc) {
+        if (tc.name === "transfer_call") {
+          try {
+            const args = JSON.parse(tc.arguments);
+            const ext = args.target_extension;
+            if (ext) {
+              didTransfer = true;
+              console.log(`📠 AI Triggered SIP Transfer to Extension: ${ext}`);
+              // Play a quick goodbye TTS out-of-bounds so caller doesn't hear dead air
+              await flushTTS("Please hold while I transfer your call.");
+              await transferCallback(ext);
+              break; 
+            }
+          } catch(e) {
+             console.error("❌ Failed to parse tool arguments:", e.message);
+          }
+        }
+      }
+    }
+
+    // If it transferred, don't execute normal history push
+    if (didTransfer) return;
 
     // Record output tokens
     if (rateLimitConfig && callId && extensionId) {
@@ -700,7 +782,7 @@ IMPORTANT: Always reply in the SAME language the user is speaking.
 }
 
 // ── Call Handler ──────────────────────────────────────────────────────────────
-async function handleCall(localRtpPort, remote, callMeta, agentConfig, ragChunks, rateLimitConfig, extensionId, dynamicDataContent, preBoundRtpSock) {
+async function handleCall(remote, callMeta, agentConfig, ragChunks, rateLimitConfig, extensionId, dynamicDataContent, pbxExtensionsStr, transferCallback, preBoundRtpSock) {
   const history = [];
   let currentSender = null;
   let botSpeaking = false;
@@ -783,6 +865,8 @@ async function handleCall(localRtpPort, remote, callMeta, agentConfig, ragChunks
       callMeta.callId,
       extensionId,
       dynamicDataContent,
+      pbxExtensionsStr,
+      transferCallback,
       () => {
         // Fired instantly before the first RTP bits are sent across the wire
         botSpeaking = true;
@@ -977,7 +1061,38 @@ srf.invite(async (req, res) => {
       }
     }
 
-    const session = await handleCall(port, remote, callMeta, agentConfig, ragChunks, rateLimitConfig, extensionId?.toString(), dynamicDataContent, rtpSock);
+    // Fetch live PBX extensions for AI transfer capability
+    let pbxExtensionsStr = "";
+    try {
+      const liveExts = await getLiveExtensions();
+      const available = liveExts.filter(e => e.presence_status === "available");
+      if (available.length > 0) {
+        pbxExtensionsStr = available.map(e => `- ${e.caller_id_name || 'User'} (${e.role_name || 'Staff'}) -> Ext ${e.number}`).join("\n");
+        console.log(`📞 Found ${available.length} active extensions ready for call transfers.`);
+      }
+    } catch (e) {
+      console.error("❌ Failed to fetch PBX extensions for AI routing context.");
+    }
+
+    const transferCallback = async (targetExtension) => {
+      console.log(`🔀 Executing Blind SIP Transfer to Extension ${targetExtension}...`);
+      try {
+        const domain = process.env.SIP_DOMAIN || "naqliat.bhycm.yeastarcloud.com";
+        await dialog.request({
+          method: "REFER",
+          headers: {
+            "Refer-To": `sip:${targetExtension}@${domain}`
+          }
+        });
+        // Hang up our leg gracefully
+        dialog.destroy();
+        session.close();
+      } catch (err) {
+        console.error("❌ SIP Transfer failed:", err.message);
+      }
+    };
+
+    const session = await handleCall(remote, callMeta, agentConfig, ragChunks, rateLimitConfig, extensionId?.toString(), dynamicDataContent, pbxExtensionsStr, transferCallback, rtpSock);
 
     // ── Log to DB + in-memory ──────────────────────────────────────────────
     await CallLog.create({
